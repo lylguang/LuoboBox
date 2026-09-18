@@ -1,0 +1,3 @@
+# 萝卜盒运行时依赖
+# 装完这些就能跑：python -m luobobox
+PySide6>=6.6

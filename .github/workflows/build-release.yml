@@ -1,0 +1,58 @@
+name: 构建与发布
+
+# 只在推送版本 tag（v1.0.0 这类）时真正出包并创建 Release；
+# 也可以在 Actions 页面手动触发，只产出构建结果供下载。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Windows 构建
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: 安装 Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      # assets/ 未入库（图标由 make_icon.py 生成），build.py 会自动补生成。
+      # 跳过 --selftest：它会拉起 QApplication，在无桌面会话的 runner 上没有意义。
+      - name: 打包（便携版 + 安装包）
+        run: python packaging/build.py --zip --installer --no-selftest
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: LuoboBox-dist
+          path: |
+            dist/LuoboBox-Setup-*.exe
+            dist/LuoboBox-*-便携版.zip
+          if-no-files-found: error
+
+      - name: 创建 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/LuoboBox-Setup-*.exe
+            dist/LuoboBox-*-便携版.zip
+          generate_release_notes: true
+          draft: false

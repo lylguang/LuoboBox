@@ -1,0 +1,5 @@
+# 开发/打包额外依赖
+-r requirements.txt
+
+pyinstaller>=6.0
+pillow>=10.0          # 只用 packaging/make_icon.py 生成图标时需要
