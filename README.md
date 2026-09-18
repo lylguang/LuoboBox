@@ -5,7 +5,7 @@
 
 > 自用工具。不修改 codebuddy2api 的源码结构（脱敏词表补丁例外，且改前必先备份）。
 
-**官网下载**：<https://luobox.aifeng.icu/>　·　**源码仓库**：<https://github.com/lylguang/LuoboBox>
+**官网下载**：<https://luobox.aifeng.icu/>　·　**源码仓库**：<https://github.com/yuleDI/LuoboBox>
 
 ---
 
