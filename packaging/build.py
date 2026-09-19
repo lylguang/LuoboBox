@@ -22,6 +22,15 @@ import time
 import zipfile
 from pathlib import Path
 
+# Windows 上 stdout 的默认编码取决于控制台代码页：本地是 GBK，GitHub Actions
+# 的 runner 是 cp1252 —— 两者都装不下中文，第一行 print 就会 UnicodeEncodeError。
+# 统一强制成 UTF-8，本地与 CI 行为一致。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGING = ROOT / "packaging"
 DIST = ROOT / "dist"

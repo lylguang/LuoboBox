@@ -15,6 +15,10 @@ jobs:
   build:
     name: Windows 构建
     runs-on: windows-latest
+    env:
+      # runner 默认代码页是 cp1252，强制 Python 走 UTF-8，避免中文 print 崩掉
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
 
     steps:
       - name: 检出源码
