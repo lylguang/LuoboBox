@@ -7,8 +7,11 @@
 
 产物：
     dist/LuoboBox/            onedir 发行目录
-    dist/LuoboBox-<版本>-便携版.zip
+    dist/LuoboBox-<版本>-portable.zip
     dist/LuoboBox-Setup-<版本>.exe   （若本机有 Inno Setup）
+
+注：便携版 zip 刻意用纯 ASCII 文件名 —— 中文名（"便携版"）在 GitHub Actions
+上传 Release 资产时会被剥掉，变成 `LuoboBox-1.0.0-.zip` 这种残缺名。
 """
 
 from __future__ import annotations
@@ -196,7 +199,8 @@ def human(n: int) -> str:
 
 def make_portable_zip(version: str, build_id: str) -> Path:
     src = DIST / "LuoboBox"
-    out = DIST / f"LuoboBox-{version}-便携版.zip"
+    # 纯 ASCII 名：中文在 GitHub Release 资产名里会被吞掉（见文件头注释）
+    out = DIST / f"LuoboBox-{version}-portable.zip"
     log(f"打包便携版 {out.name}…")
     # 写到暂存再 os.replace，避免直接 truncate 现有归档
     tmp = DIST / "_stage" / f"{build_id}.zip"

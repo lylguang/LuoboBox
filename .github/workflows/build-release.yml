@@ -48,7 +48,7 @@ jobs:
           name: LuoboBox-dist
           path: |
             dist/LuoboBox-Setup-*.exe
-            dist/LuoboBox-*-便携版.zip
+            dist/LuoboBox-*-portable.zip
           if-no-files-found: error
 
       - name: 创建 Release
@@ -57,6 +57,6 @@ jobs:
         with:
           files: |
             dist/LuoboBox-Setup-*.exe
-            dist/LuoboBox-*-便携版.zip
+            dist/LuoboBox-*-portable.zip
           generate_release_notes: true
           draft: false
