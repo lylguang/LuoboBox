@@ -29,7 +29,8 @@ Funnel 挂了要手动 `tailscale funnel --bg` 重挂、服务莫名退出要看
 | **客户端自动化** | 一键写入 Codex `config.toml` 与 Claude Code `settings.json`，改前自动备份，可一键还原 |
 | **日志查看器** | 实时 tail 网关日志，关键字过滤、自动滚动、清空、导出 |
 | **补丁守护** | 检测 `SENSITIVE_TERMS` 是否仍含 `OpenAI/Codex/ChatGPT/GPT-4/GPT-5`，缺失自动补回 |
-| **更新器** | 检查上游 release → 全目录备份 → 覆盖（保留 `auth/`、`.env`、启动脚本）→ **自动重打补丁** |
+| **网关更新器** | 检查上游 release → 全目录备份 → 覆盖（保留 `auth/`、`.env`、启动脚本）→ **自动重打补丁** |
+| **应用自更新** | 检查本项目的 GitHub Release → 自动选包（安装版跑静默 Setup / 便携版原地覆盖）→ 退出并自动重启 |
 | **环境自愈** | 每次启动自动修正失效的网关目录、Python 路径、被占用的端口 |
 | **首次向导** | 4 步完成全部配置，含解释器自动探测 |
 
@@ -69,7 +70,7 @@ python packaging/build.py --clean --zip --installer
 | 路径 | 说明 |
 |---|---|
 | `dist/LuoboBox/` | onedir 发行目录，双击 `LuoboBox.exe` 即可 |
-| `dist/LuoboBox-<版本>-便携版.zip` | 便携包 |
+| `dist/LuoboBox-<版本>-portable.zip` | 便携包（纯 ASCII 名，中文会被 Release 吞掉） |
 | `dist/LuoboBox-Setup-<版本>.exe` | 安装包 |
 
 > `packaging/luobobox.iss` 与 `packaging/version_info.txt` 由 `build.py` 每次构建重写
@@ -134,7 +135,8 @@ luobobox/
 │   ├── funnel.py          Tailscale Funnel 开关
 │   ├── clientconfig.py    Codex / Claude Code 配置的手术式改写与还原
 │   ├── patcher.py         脱敏词表补丁守护
-│   ├── updater.py         上游 release 检查与应用
+│   ├── updater.py         网关（codebuddy2api）上游 release 检查与应用
+│   ├── appupdater.py      萝卜盒**自身**的在线更新（下载→覆盖→重启）
 │   ├── autostart.py       开机自启（注册表 Run 键）
 │   ├── logging_setup.py   自身日志
 │   └── ui/                主题、通用部件、主窗口、托盘、向导、线程助手
@@ -158,6 +160,10 @@ python tests/gui_smoke.py
 # 端到端：真实拉起网关 → 抓健康数据 → 停止 → 校验端口释放
 # 只在内存里改端口，结束时按字节还原 config.json
 python tests/e2e_gateway_lifecycle.py
+
+# 应用自更新自测（20 项）：安装形态判定、资产挑选、版本比较、
+# 助手 .cmd 在中文路径下真的能把新版本覆盖上去、分离进程能跑完
+python tests/appupdater_selftest.py
 ```
 
 自测重点覆盖两个**静默出错**的地方：
@@ -223,7 +229,12 @@ Key 轮换后要重新执行一次「接入 Codex」（它会重写 `config.toml
 
 - **目标机器需要 Python + `fastapi`/`uvicorn`/`httpx`**：萝卜盒会自动探测本机
   可用解释器，也可以在「设置 → 解释器」手动指定。当前不内嵌解释器。
-- **自动更新只覆盖网关代码**，不含萝卜盒自身。
+- **两条更新链路彼此独立**：「更新」页里 `萝卜盒更新` 只换萝卜盒自己
+  （来源 `lylguang/LuoboBox` 的 Release，装完自动重启）；`网关更新` 只换
+  `codebuddy2api` 源码（来源上游 release，保留 `auth/`、`.env` 与补丁）。
+- **应用自更新需要退出一次**：Windows 上正在运行的 exe 无法自我覆盖，
+  所以流程是「下载 → 交给一个一次性 `cmd` 助手 → 主程序退出 → 覆盖/静默安装
+  → 自动重启」。助手脚本与日志落在 `<数据目录>\updates\`。
 - **不内嵌 WebUI**：「打开管理台」交给系统默认浏览器 —— 省掉 ~100MB 的
   QtWebEngine，而且管理台本来就是网页应用。
 - 账号风控、上游 ToS、公网暴露风险与原项目一致，萝卜盒不改也不规避这些。

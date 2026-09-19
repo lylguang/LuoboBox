@@ -102,7 +102,7 @@ class TrayController(QObject):
         self.act_checkin.triggered.connect(self._checkin)
         m.addAction(self.act_checkin)
 
-        self.act_update = QAction("检查更新", m)
+        self.act_update = QAction("检查更新（萝卜盒 / 网关）", m)
         self.act_update.triggered.connect(self._check_update)
         m.addAction(self.act_update)
         m.addSeparator()
@@ -176,6 +176,8 @@ class TrayController(QObject):
     def _check_update(self) -> None:
         self.window.tabs.setCurrentIndex(3)
         self._show_window()
+        # 两条独立的更新链路：萝卜盒自己 + 网关
+        self.window._check_app_update()  # noqa: SLF001
         self.window._check_update()  # noqa: SLF001
 
     def _toggle_autostart(self, checked: bool) -> None:

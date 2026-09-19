@@ -94,10 +94,15 @@ def default_config() -> dict[str, Any]:
             "last_gateway_dir": str(gw),
         },
         "updater": {
+            # 网关（codebuddy2api）的上游仓库 —— 由 updater.py 消费
             "repo": "maiphucgiang/codebuddy2api",
+            # 萝卜盒自己的发布仓库 —— 由 appupdater.py 消费
+            "app_repo": "lylguang/LuoboBox",
             "check_on_start": True,
             "last_check": "",
             "last_known_version": "",
+            "app_last_check": "",
+            "app_last_known_version": "",
         },
         "ui": {
             "log_tail_lines": 800,

@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import theme
-from .. import __version__, autostart, patcher, updater
+from .. import __version__, appupdater, autostart, patcher, updater
 from ..clientconfig import snippet_claude, snippet_codex
 from ..config import gen_api_key, port_free
 from ..context import AppContext, warn_scheduled_task
@@ -415,8 +415,36 @@ class MainWindow(QMainWindow):
         self.update_toast = Toast()
         box.addWidget(self.update_toast)
 
-        card = Card("网关版本", "更新来源：上游 GitHub release。升级会自动保留 auth/、.env "
-                              "和既有启动脚本，并自动重打脱敏补丁")
+        # ---- 萝卜盒自身（应用）更新 --------------------------------------
+        app_card = Card(
+            "萝卜盒更新",
+            f"让萝卜盒自己升级到最新版。来源：本项目的 GitHub Release。"
+            f"升级方式按安装形态自动选择（安装版走静默安装包，便携版走原地覆盖），"
+            f"完成后自动重启；配置 / 日志 / 备份都在 {appupdater.updates_dir().parent}，不受影响")
+        self.kv_app_local = KeyValue("当前版本", __version__, mono=True)
+        self.kv_app_remote = KeyValue("最新版本", "未检查", mono=True)
+        app_card.add(self.kv_app_local)
+        app_card.add(self.kv_app_remote)
+
+        row_app = QHBoxLayout()
+        self.btn_check_app = _btn("检查应用更新", "primary")
+        self.btn_do_app_update = _btn("立即更新萝卜盒")
+        self.btn_do_app_update.setEnabled(False)
+        row_app.addWidget(self.btn_check_app)
+        row_app.addWidget(self.btn_do_app_update)
+        row_app.addStretch(1)
+        app_card.add_layout(row_app)
+
+        self.app_update_notes = QPlainTextEdit()
+        self.app_update_notes.setReadOnly(True)
+        self.app_update_notes.setMaximumHeight(160)
+        self.app_update_notes.setPlaceholderText("检查后在此显示新版本说明…")
+        app_card.add(self.app_update_notes)
+        box.addWidget(app_card)
+
+        # ---- 网关（codebuddy2api）更新 ------------------------------------
+        card = Card("网关更新", "更新来源：上游 GitHub release。升级会自动保留 auth/、.env "
+                               "和既有启动脚本，并自动重打脱敏补丁")
         self.kv_local_ver = KeyValue("当前版本", updater.local_version(
             self.ctx.config.get("gateway.dir")) or "未知", mono=True)
         self.kv_remote_ver = KeyValue("上游版本", "未检查", mono=True)
@@ -616,6 +644,9 @@ class MainWindow(QMainWindow):
         self.btn_log_refresh.clicked.connect(self._refresh_log)
         self.btn_log_open.clicked.connect(lambda: self._open_path(log_dir()))
         self.btn_log_clear.clicked.connect(self._clear_log)
+
+        self.btn_check_app.clicked.connect(self._check_app_update)
+        self.btn_do_app_update.clicked.connect(self._do_app_update)
 
         self.btn_check_update.clicked.connect(self._check_update)
         self.btn_do_update.clicked.connect(self._do_update)
@@ -899,7 +930,97 @@ class MainWindow(QMainWindow):
             self.log_view.clear()
             self._on_toast("日志已清空", "ok")
 
-    # ---------------------------------------------------------- 更新
+    # ---------------------------------------------------------- 应用自更新
+
+    def _check_app_update(self) -> None:
+        """检查萝卜盒自己有没有新版本（与网关更新是两条独立的路）。"""
+        repo = str(self.ctx.config.get("updater.app_repo", "lylguang/LuoboBox"))
+        self._app_check_result = None
+
+        def done(info):
+            self._app_check_result = info
+            if info.error:
+                self._on_toast(info.error, "error")
+                self.app_update_notes.setPlainText(info.error)
+                self.btn_do_app_update.setEnabled(False)
+                return
+            self.kv_app_remote.set_value(info.tag or "未知")
+            self.kv_app_local.set_value(info.local_version or __version__)
+            if info.newer:
+                self._on_toast(f"萝卜盒有新版本 {info.tag}（当前 {__version__}）", "warn")
+                self.app_update_notes.setPlainText(
+                    f"{info.name}\n发布于 {info.published}\n\n{info.notes}")
+                self.btn_do_app_update.setEnabled(True)
+            else:
+                self._on_toast(f"萝卜盒已是最新（{__version__}）", "ok")
+                self.app_update_notes.setPlainText("当前已是最新版本。")
+                self.btn_do_app_update.setEnabled(False)
+
+        self.ctx.run_task(
+            lambda: appupdater.check_app(repo), done,
+            lambda m: self._on_toast(f"检查应用更新失败：{m.splitlines()[0]}", "error"),
+            busy_text="正在检查萝卜盒更新…",
+        )
+
+    def _do_app_update(self) -> None:
+        info = getattr(self, "_app_check_result", None)
+        if not info or info.error:
+            self._on_toast("请先检查应用更新", "warn")
+            return
+        if not info.newer:
+            self._on_toast("已是最新版本，无需更新", "ok")
+            return
+
+        mode = appupdater.install_mode()
+        asset = appupdater.pick_asset(info, mode)
+        if not asset:
+            self._on_toast("该版本没有可用的更新包（缺 portable.zip / Setup.exe）", "error")
+            return
+        name, url = asset
+        kind = "安装包（静默安装）" if mode == "installer" else "便携包（原地覆盖）"
+        dest = appupdater.updates_dir()
+        if QMessageBox.question(
+            self, "更新萝卜盒",
+            f"将下载 {info.tag} 的{kind}：\n    {name}\n\n"
+            f"下载完成后萝卜盒会**自动关闭**，由后台助手完成替换并重新启动。\n\n"
+            f"· 安装形态：{mode}\n"
+            f"· 下载与日志目录：{dest}\n"
+            f"· 配置 / 日志 / 备份不受影响\n\n现在更新？",
+        ) != QMessageBox.Yes:
+            return
+
+        self.ctx.run_task(
+            lambda: self._do_app_update_work(mode, name, url),
+            self._after_app_update,
+            lambda m: self._on_toast(f"应用更新失败：{m.splitlines()[0]}", "error"),
+            busy_text="正在下载萝卜盒更新…",
+        )
+
+    def _do_app_update_work(self, mode: str, name: str, url: str) -> str:
+        archive = appupdater.download(url, appupdater.updates_dir(), name)
+        plan = appupdater.apply_and_restart(mode, archive)
+        if not plan.ok:
+            return plan.message
+        return plan.message
+
+    def _after_app_update(self, message: str) -> None:
+        self._on_toast(f"{message}；萝卜盒即将退出并自动重启…", "ok")
+        QTimer.singleShot(1200, self._quit_for_update)
+
+    def _quit_for_update(self) -> None:
+        """交棒给助手脚本：先落盘配置，再正常退出，让文件锁释放。"""
+        try:
+            self.ctx.config.set("updater.app_last_check",
+                                time.strftime("%Y-%m-%d %H:%M:%S"))
+            self.ctx.config.save()
+        except Exception:  # noqa: BLE001
+            pass
+        self.request_quit()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    # ---------------------------------------------------------- 网关更新
 
     def _check_update(self) -> None:
         gw = self.ctx.config.get("gateway.dir")
