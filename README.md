@@ -150,7 +150,7 @@ luobobox/
 ## 测试
 
 ```bash
-# 核心逻辑自测（77 项，不需要图形界面）
+# 核心逻辑自测（80 项，不需要图形界面）
 python tests/selftest.py
 
 # GUI 冒烟：构建真实窗口并逐页签截图到 tests/_shots/
@@ -164,6 +164,12 @@ python tests/e2e_gateway_lifecycle.py
 # 应用自更新自测（20 项）：安装形态判定、资产挑选、版本比较、
 # 助手 .cmd 在中文路径下真的能把新版本覆盖上去、分离进程能跑完
 python tests/appupdater_selftest.py
+
+# 发版后校验（可选，需联网，会下载 ~50MB）：
+# 真下 GitHub Release 的便携包，覆盖一份 dist/LuoboBox 老安装，
+# 断言 exe 的 ProductVersion 真的换了代、包内文件无一缺失且字节一致
+python tests/e2e_release_asset.py          # 校验 latest
+python tests/e2e_release_asset.py v1.0.1   # 校验指定 tag
 ```
 
 自测重点覆盖两个**静默出错**的地方：
