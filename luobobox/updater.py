@@ -42,6 +42,18 @@ KEEP_PATHS = {
     "gateway.log",
 }
 
+# 升级时必须原样保留的「目录内子路径」（相对网关目录）。
+#
+# 为什么需要它：下面的覆盖动作是「整目录 rmtree + copytree」。而上游仓库里
+# web/.gitignore 把 dist/ 忽略了 —— 升级包里的 web/ 只有 src，一覆盖就把本地
+# 构建好的 web/dist 连根拔掉，/dashboard/ 立刻 503「WebUI 尚未构建」。
+# 这正是「后台管理打不开」的根因，且每次升级都必然复发。
+# node_modules 同理：重装一次要好几分钟。
+PRESERVE_SUBPATHS = (
+    "web/dist",
+    "web/node_modules",
+)
+
 
 @dataclass
 class ReleaseInfo:
@@ -166,26 +178,60 @@ def apply_release(gateway_dir: Path | str, archive: Path) -> ApplyResult:
         return result
 
     # 2) 解包
+    # 暂存目录刻意放在**网关同盘**下：跨盘 shutil.move 会退化成真拷贝，
+    # node_modules 那种几万个小文件能卡上几分钟。
+    holds = gw.parent / f".luobobox-keep-{stamp}"
     try:
         with tempfile.TemporaryDirectory(prefix="luobobox-rel-") as tmp:
             staging = _extract(archive, Path(tmp))
             # 3) 逐项覆盖（保留清单跳过）
             copied: list[str] = []
+            stash: list[tuple[Path, Path]] = []
             for item in staging.iterdir():
                 if item.name in KEEP_PATHS:
                     continue
                 target = gw / item.name
                 if item.is_dir():
                     if target.exists():
+                        # 覆盖前先把构建产物搬走（上游包里没有它们）
+                        for relative in PRESERVE_SUBPATHS:
+                            rel = Path(relative)
+                            if rel.parts[0] != item.name:
+                                continue
+                            live = gw / rel
+                            if not live.exists():
+                                continue
+                            held = holds / ("__".join(rel.parts))
+                            try:
+                                held.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.move(str(live), str(held))
+                                stash.append((held, live))
+                            except Exception:  # noqa: BLE001
+                                pass
                         shutil.rmtree(target, ignore_errors=True)
                     shutil.copytree(item, target)
                 else:
                     shutil.copy2(item, target)
                 copied.append(item.name)
+            # 3b) 把暂存的构建产物放回去
+            for held, live in stash:
+                if not held.exists():
+                    continue
+                try:
+                    if live.exists():
+                        shutil.rmtree(live, ignore_errors=True)
+                    live.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(held), str(live))
+                except Exception:  # noqa: BLE001
+                    pass
+            if stash:
+                copied.append(f"{len(stash)} 项前端构建产物已保留")
             result.message = f"已覆盖 {len(copied)} 项：{'、'.join(sorted(copied)[:12])}"
     except Exception as exc:  # noqa: BLE001
         result.message = f"解包/覆盖失败（已备份到 {backup.name}）：{exc}"
         return result
+    finally:
+        shutil.rmtree(holds, ignore_errors=True)
 
     # 4) 自动重打脱敏补丁 —— 这是升级流程里最容易忘、后果最重的一步
     try:

@@ -121,14 +121,56 @@ class MainWindow(QMainWindow):
         root.addWidget(self._header())
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._tab_overview(), "概览")
-        self.tabs.addTab(self._tab_clients(), "客户端接入")
-        self.tabs.addTab(self._tab_logs(), "日志")
-        self.tabs.addTab(self._tab_update(), "更新")
-        self.tabs.addTab(self._tab_settings(), "设置")
+        # 页签索引集中登记。以前 _on_toast / _refresh_log 里把 1/2/3 写死，
+        # 一插入新页签就会静默错位（提示条跑到别页、日志不再自动刷新）。
+        self._tab_index: dict[str, int] = {}
+        for key, label, widget in (
+            ("overview", "概览", self._tab_overview()),
+            ("admin", "管理台", self._tab_admin()),
+            ("clients", "客户端接入", self._tab_clients()),
+            ("logs", "日志", self._tab_logs()),
+            ("update", "更新", self._tab_update()),
+            ("settings", "设置", self._tab_settings()),
+        ):
+            self._tab_index[key] = self.tabs.addTab(widget, label)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self.tabs, 1)
 
         self.statusBar().showMessage("就绪")
+
+    def _on_tab_changed(self, index: int) -> None:
+        """切到「管理台」时才拉数据 —— 不打扰其它页签，也不空转网络。"""
+        if index == self._tab_index.get("admin"):
+            self.admin.refresh()
+
+    # ---------------------------------------------------------------- 管理台
+
+    def _tab_admin(self) -> QWidget:
+        """原生管理台。
+
+        为什么不用内嵌 WebUI：上游前端的 dist/ 不在源码仓库里，而网关升级是
+        「整目录 rmtree + copytree」—— 每次升级都会把 web/dist 冲掉，
+        /dashboard/ 直接 503。这就是「后台管理打不开」的根因，且必然复发。
+        这里直接调网关的 /admin REST 接口，与前端构建彻底解耦。
+        """
+        from .admin import AdminConsole
+
+        self.admin = AdminConsole(self.ctx)
+
+        page = QWidget()
+        box = QVBoxLayout(page)
+        box.setContentsMargins(12, 12, 12, 8)
+        box.setSpacing(8)
+
+        hint = QLabel(
+            "本页直接调用网关的管理接口，与前端构建无关 —— 升级网关也不会再「打不开」。"
+            "新增账号、看用量、翻日志都在这里。"
+        )
+        hint.setObjectName("mute")
+        hint.setWordWrap(True)
+        box.addWidget(hint)
+        box.addWidget(self.admin, 1)
+        return page
 
     # ---------------------------------------------------------------- 页头
 
@@ -157,7 +199,10 @@ class MainWindow(QMainWindow):
         self.btn_start = _btn("启动", "primary")
         self.btn_stop = _btn("停止")
         self.btn_restart = _btn("重启")
-        self.btn_dashboard = _btn("打开管理台")
+        self.btn_dashboard = _btn("网页版管理台")
+        self.btn_dashboard.setToolTip(
+            "用浏览器打开网关自带的 WebUI（/dashboard/）。\n"
+            "日常用上面的「管理台」页签即可；这个入口留给多屏 / 远程场景。")
         for b in (self.btn_start, self.btn_stop, self.btn_restart, self.btn_dashboard):
             row.addWidget(b)
         return box
@@ -221,8 +266,8 @@ class MainWindow(QMainWindow):
 
         # ---- 凭证池
         cred = Card("凭证池",
-                    "这里只做展示（每 15 秒自动刷新）。新增账号请到「管理台 → 凭证管理」"
-                    "用 OAuth 扫码或导入 .info 文件，加完会自动出现在下表。")
+                    "这里只做展示（每 15 秒自动刷新）。新增账号请到「管理台 → 凭证」"
+                    "用扫码或导入 .info 文件，加完会自动出现在下表。")
         self.cred_table = QTableWidget(0, 4)
         self.cred_table.setHorizontalHeaderLabels(["账号", "健康", "积分", "状态"])
         self.cred_table.verticalHeader().setVisible(False)
@@ -236,10 +281,10 @@ class MainWindow(QMainWindow):
         cred.add(self.cred_table)
 
         cred_row = QHBoxLayout()
-        self.btn_add_cred = _btn("添加账号（打开管理台）", "primary")
+        self.btn_add_cred = _btn("添加账号（扫码 / 导入）", "primary")
         self.btn_add_cred.setToolTip(
             "萝卜盒本身不写凭证，所有账号都在管理台里添加。\n"
-            "点这里直接打开 管理台 → 凭证管理 页面。"
+            "点这里直接切到「管理台 → 凭证」页。"
         )
         self.btn_refresh_cred = _btn("刷新凭证池", "ghost")
         cred_row.addWidget(self.btn_add_cred)
@@ -788,17 +833,22 @@ class MainWindow(QMainWindow):
         self._refresh_state()
 
     def _on_toast(self, text: str, level: str) -> None:
-        widget = self.overview_toast
-        idx = self.tabs.currentIndex()
-        if idx == 1:
-            widget = self.client_toast
-        elif idx == 3:
-            widget = self.update_toast
+        widget = self._tab_toast()
         widget.show_message(text, level)
         self.statusBar().showMessage(text.splitlines()[0][:120], 8000)
 
+    def _tab_toast(self):
+        """提示条跟着当前页签走 —— 用键查索引，别再写死数字。"""
+        idx = self.tabs.currentIndex()
+        for key, widget in (("clients", getattr(self, "client_toast", None)),
+                            ("update", getattr(self, "update_toast", None)),
+                            ("admin", getattr(getattr(self, "admin", None), "toast", None))):
+            if widget is not None and idx == self._tab_index.get(key):
+                return widget
+        return self.overview_toast
+
     def _refresh_log(self) -> None:
-        if not self.isVisible() or self.tabs.currentIndex() != 2:
+        if not self.isVisible() or self.tabs.currentIndex() != self._tab_index.get("logs"):
             return
         text = self.ctx.gateway.tail_log(int(self.ctx.config.get("ui.log_tail_lines", 800)))
         needle = self.log_filter.text().strip()
@@ -824,9 +874,12 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl(self.ctx.config.dashboard_url()))
 
     def _open_credentials_page(self) -> None:
-        """账号只在管理台里添加 —— 直接跳到「凭证管理」页，省得用户找。"""
-        QDesktopServices.openUrl(QUrl(
-            self.ctx.config.base_url() + "/dashboard/credentials"))
+        """账号只在管理台里添加 —— 直接切到「管理台 → 凭证」，省得用户找。"""
+        index = self._tab_index.get("admin")
+        if index is None:
+            return
+        self.tabs.setCurrentIndex(index)
+        self.admin.show_credentials_tab()
 
     def _open_path(self, path) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
@@ -1279,6 +1332,10 @@ class MainWindow(QMainWindow):
             )
             return
         self._closing = True
+        try:
+            self.admin.stop()   # 停掉扫码轮询定时器，否则退出后还在后台打网关
+        except Exception:  # noqa: BLE001
+            pass
         self.ctx.shutdown()
         event.accept()
 

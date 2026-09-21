@@ -247,6 +247,10 @@ def main(argv: list[str] | None = None) -> int:
 
     window = MainWindow(ctx)
 
+    # 额度消耗标签页：基于本地余额快照反推的消耗统计（纯本地，不依赖上游网关）
+    from . import usage_view
+    window.tabs.addTab(usage_view.build_usage_tab(ctx), "额度消耗")
+
     if tray_available:
         from .ui.tray import TrayController
 

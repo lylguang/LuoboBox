@@ -28,6 +28,8 @@ Funnel 挂了要手动 `tailscale funnel --bg` 重挂、服务莫名退出要看
 | **接入地址** | 本机 / 局域网 / Tailscale / 公网 四个地址一键复制，API Key 可显隐 |
 | **客户端自动化** | 一键写入 Codex `config.toml` 与 Claude Code `settings.json`，改前自动备份，可一键还原 |
 | **日志查看器** | 实时 tail 网关日志，关键字过滤、自动滚动、清空、导出 |
+| **管理台（原生）** | 统计 / 模型 / 凭证 / 日志 / 设置 五个子页签，**直接调网关 `/admin/*` REST**，与前端构建解耦 |
+| **额度消耗** | 基于本地余额快照反推消耗，看累计 / 今日消耗与每账号明细（纯本地，不依赖上游） |
 | **补丁守护** | 检测 `SENSITIVE_TERMS` 是否仍含 `OpenAI/Codex/ChatGPT/GPT-4/GPT-5`，缺失自动补回 |
 | **网关更新器** | 检查上游 release → 全目录备份 → 覆盖（保留 `auth/`、`.env`、启动脚本）→ **自动重打补丁** |
 | **应用自更新** | 检查本项目的 GitHub Release → 自动选包（安装版跑静默 Setup / 便携版原地覆盖）→ 退出并自动重启 |
@@ -138,8 +140,10 @@ luobobox/
 │   ├── updater.py         网关（codebuddy2api）上游 release 检查与应用
 │   ├── appupdater.py      萝卜盒**自身**的在线更新（下载→覆盖→重启）
 │   ├── autostart.py       开机自启（注册表 Run 键）
+│   ├── usage.py           额度消耗统计（本地余额快照反推，纯本地）
+│   ├── usage_view.py      「额度消耗」页签
 │   ├── logging_setup.py   自身日志
-│   └── ui/                主题、通用部件、主窗口、托盘、向导、线程助手
+│   └── ui/                主题、通用部件、主窗口、托盘、向导、线程助手、**管理台（admin.py）**
 ├── assets/                图标（由 packaging/make_icon.py 生成）
 ├── packaging/             打包脚本、spec、安装包定义
 └── tests/                 自测与 GUI 冒烟测试
@@ -165,11 +169,15 @@ python tests/e2e_gateway_lifecycle.py
 # 助手 .cmd 在中文路径下真的能把新版本覆盖上去、分离进程能跑完
 python tests/appupdater_selftest.py
 
+# 网关更新保产物自测（19 项）：升级时必须保住 web/dist 与 web/node_modules，
+# 否则网页版管理台会因缺构建产物而 503「WebUI 尚未构建」
+python tests/updater_preserve_selftest.py
+
 # 发版后校验（可选，需联网，会下载 ~50MB）：
 # 真下 GitHub Release 的便携包，覆盖一份 dist/LuoboBox 老安装，
 # 断言 exe 的 ProductVersion 真的换了代、包内文件无一缺失且字节一致
 python tests/e2e_release_asset.py          # 校验 latest
-python tests/e2e_release_asset.py v1.0.1   # 校验指定 tag
+python tests/e2e_release_asset.py v1.0.2   # 校验指定 tag
 ```
 
 自测重点覆盖两个**静默出错**的地方：
@@ -241,8 +249,13 @@ Key 轮换后要重新执行一次「接入 Codex」（它会重写 `config.toml
 - **应用自更新需要退出一次**：Windows 上正在运行的 exe 无法自我覆盖，
   所以流程是「下载 → 交给一个一次性 `cmd` 助手 → 主程序退出 → 覆盖/静默安装
   → 自动重启」。助手脚本与日志落在 `<数据目录>\updates\`。
-- **不内嵌 WebUI**：「打开管理台」交给系统默认浏览器 —— 省掉 ~100MB 的
-  QtWebEngine，而且管理台本来就是网页应用。
+- **管理台有两条通道，都不内嵌浏览器内核**：
+  - **原生「管理台」页签**（推荐）：直接调网关 `/admin/*` REST，**不依赖 `web/dist`**，
+    所以网关怎么升级都不会坏；
+  - **网页版**：网关自带的 `/dashboard/`，需要 `codebuddy2api/web/dist` 构建产物。
+    上游 Release 不含 `dist`，因此升级时会保留本地 `web/dist`（见 `updater.PRESERVE_SUBPATHS`），
+    否则 `/dashboard/` 会 503「WebUI 尚未构建」。
+  两者都省掉了 ~100MB 的 QtWebEngine。
 - 账号风控、上游 ToS、公网暴露风险与原项目一致，萝卜盒不改也不规避这些。
 
 ---
