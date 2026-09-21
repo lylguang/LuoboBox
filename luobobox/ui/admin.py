@@ -56,13 +56,20 @@ SITE_CHOICES = [
     ("国际 CodeBuddy", "intl-codebuddy"),
 ]
 
-HEALTH_LABEL = {
-    "ready": ("正常", theme.OK),
-    "expired": ("已过期", theme.ERR),
-    "circuit_open": ("已熔断", theme.WARN),
-    "error": ("异常", theme.ERR),
-    "disabled": ("已停用", theme.TEXT_MUTE),
-}
+def health_label(health: str) -> tuple[str, str]:
+    """健康度 → (中文标签, 颜色)。
+
+    ★ 必须是函数，不能是模块级 dict。dict 会在 import 那一刻把
+    `theme.OK` 的**值**拷进去，等于把颜色冻死 —— 换到浅色主题后，
+    表格里的"异常"仍是深色主题的浅粉红（#F09595），白底上几乎看不见。
+    """
+    return {
+        "ready": ("正常", theme.OK),
+        "expired": ("已过期", theme.ERR),
+        "circuit_open": ("已熔断", theme.WARN),
+        "error": ("异常", theme.ERR),
+        "disabled": ("已停用", theme.TEXT_MUTE),
+    }.get(health, (health or "—", theme.TEXT_DIM))
 
 CLEAR_CONFIRMATION = "清空全部日志与统计"
 
@@ -393,7 +400,7 @@ class AdminConsole(QWidget):
         self.stats_balance.setRowCount(len(health))
         for r, row in enumerate(health):
             identity = row.get("id")
-            label, color = HEALTH_LABEL.get(str(row.get("health") or ""), (str(row.get("health") or "—"), theme.TEXT_DIM))
+            label, color = health_label(str(row.get("health") or ""))
             entry = official.get(identity) or {}
             _set(self.stats_balance, r, 0, row.get("name") or identity or "?")
             _set(self.stats_balance, r, 1, row.get("nickname") or "—")
@@ -576,7 +583,7 @@ class AdminConsole(QWidget):
             self.creds_table.setRowCount(len(self._creds))
             for r, c in enumerate(self._creds):
                 health = str(c.get("health") or "unknown")
-                label, color = HEALTH_LABEL.get(health, (health, theme.TEXT_DIM))
+                label, color = health_label(health)
                 _set(self.creds_table, r, 0, c.get("name") or c.get("id") or "?")
                 _set(self.creds_table, r, 1, c.get("nickname") or "—")
                 extra = ""

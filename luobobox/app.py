@@ -227,11 +227,16 @@ def main(argv: list[str] | None = None) -> int:
         log.warning("系统没有可用的托盘区域，降级为无托盘模式")
 
     from .ui import theme
-    app.setStyleSheet(theme.stylesheet())
 
     config = Config.load()
     config.set("meta.luobobox_version", __version__)
     config.save()
+
+    # 先读配置里的外观偏好，再出样式表 —— 反过来会先闪一下默认深色，
+    # 再跳成用户选的那套（很明显的"咯噔"一下）。
+    theme.apply(config.get("ui.palette"), config.get("ui.accent"),
+                config.get("ui.scale"))
+    app.setStyleSheet(theme.stylesheet())
 
     # ---- 打包自检模式：跑完启动链路就退，不进事件循环
     if "--selftest" in argv:
@@ -249,7 +254,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # 额度消耗标签页：基于本地余额快照反推的消耗统计（纯本地，不依赖上游网关）
     from . import usage_view
-    window.tabs.addTab(usage_view.build_usage_tab(ctx), "额度消耗")
+
+    # ★ 走 window.add_tab 而不是 window.tabs.addTab：
+    # 必须登记进 _tab_index，否则 goto_tab / Ctrl+7 / 命令面板都找不到这一页。
+    window.add_tab("usage", usage_view.build_usage_tab(ctx), "额度消耗")
 
     if tray_available:
         from .ui.tray import TrayController

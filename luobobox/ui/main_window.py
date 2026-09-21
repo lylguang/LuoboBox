@@ -7,12 +7,20 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QIcon, QTextCursor
+from PySide6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QIcon,
+    QKeySequence,
+    QShortcut,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -26,11 +34,13 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QStackedWidget,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -38,7 +48,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import theme
+from . import motion, theme
 from .. import __version__, appupdater, autostart, net, patcher, updater
 from ..clientconfig import snippet_claude, snippet_codex
 from ..config import gen_api_key, port_free
@@ -57,13 +67,36 @@ from ..paths import (
     migrate_data_dir,
 )
 
-HEALTH_LABEL = {
-    "ready": ("正常", theme.OK),
-    "expired": ("已过期", theme.ERR),
-    "circuit_open": ("已熔断", theme.WARN),
-    "error": ("异常", theme.ERR),
-    "disabled": ("已停用", theme.TEXT_MUTE),
+# 顶部导航分组：日常最高频的四个留在外面，其余收进「⋯ 更多」。
+# 顺序即 Ctrl+1..4 的顺序。
+TAB_PRIMARY: tuple[str, ...] = ("overview", "admin", "clients", "logs")
+
+# 状态词的短版本（塞进 96px 的环里，必须够短）。
+STATE_SHORT = {
+    "running": "运行中",
+    "starting": "启动中",
+    "stopping": "停止中",
+    "external": "外部",
+    "error": "异常",
+    "stopped": "已停止",
 }
+
+
+def health_label(health: str) -> tuple[str, str]:
+    """健康度 → (中文标签, 颜色)。
+
+    ★ 这里**必须**是函数，不能写成模块级 dict。
+    dict 会在 import 那一刻把 `theme.OK` 的**值**拷贝进去，等于把颜色冻住；
+    换到浅色主题后表格里的"异常"还是深色主题那种浅粉红（#F09595），
+    铺在白底上几乎看不见。函数每次调用都重新取当前主题的颜色。
+    """
+    return {
+        "ready": ("正常", theme.OK),
+        "expired": ("已过期", theme.ERR),
+        "circuit_open": ("已熔断", theme.WARN),
+        "error": ("异常", theme.ERR),
+        "disabled": ("已停用", theme.TEXT_MUTE),
+    }.get(health, (health, theme.TEXT_DIM))
 
 
 def _fmt_credits(value) -> str:
@@ -111,14 +144,92 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"萝卜盒 LuoboBox {__version__}")
         if icon_path().is_file():
             self.setWindowIcon(QIcon(str(icon_path())))
-        self.resize(940, 720)
+        self._shortcuts: list[QShortcut] = []
+        self._last_snap = None
         self.setMinimumSize(780, 560)
+        self._restore_geometry()
+
+        # 新版本角标：两条更新链路各自登记，合成一条给托盘 / 标题用
+        self._badge_parts: dict[str, str] = {"app": "", "gateway": ""}
+        self.update_badge = ""
+        self._update_listeners: list = []
 
         self._build()
         self._connect()
+        self._bind_shortcuts()
 
         self.ctx.refresh_health()
         QTimer.singleShot(900, self._post_show_checks)
+
+    # ================================================================ 新版本角标
+
+    def on_update_found(self, fn) -> None:
+        """注册「发现新版本」回调（托盘用）。回调签名 fn(text: str)。"""
+        self._update_listeners.append(fn)
+
+    def set_update_badge(self, which: str, text: str) -> None:
+        """登记某条更新链路的新版本角标。
+
+        `which` 取 "app"（萝卜盒自己）或 "gateway"（网关）。
+        两条链路是**独立**的，谁先检查完谁先登记 —— 所以按 key 分开存再合成，
+        否则后检查完的那条一"没有新版本"就会把另一条的角标清掉。
+        """
+        self._badge_parts[which] = (text or "").strip()
+        parts = [p for p in self._badge_parts.values() if p]
+        self.update_badge = " / ".join(parts)
+        for fn in list(self._update_listeners):
+            try:
+                fn(self.update_badge)
+            except Exception:
+                pass  # 角标只是提示，绝不能因为它把更新流程带崩
+
+    # ================================================================ 窗口几何
+
+    def _restore_geometry(self) -> None:
+        """恢复上次的窗口大小 / 位置；还没有记录时按屏幕大小给一个首屏尺寸。
+
+        为什么要记：把日志页拉大、把窗口挪到副屏，是用户对这套工具
+        「配置」的一部分。每次都重置回 940×720，等于永远不承认这个配置。
+        """
+        from PySide6.QtGui import QGuiApplication
+
+        screen = QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen is not None else None
+
+        default_w, default_h = 940, 720
+        if avail is not None:
+            # 1080p 以上还开 940 宽，四张卡片会被挤到折行；
+            # 但也不能全屏铺满 —— 工具窗口铺满反而让人找不到重点。
+            default_w = min(max(940, int(avail.width() * 0.56)), 1360)
+            default_h = min(max(720, int(avail.height() * 0.74)), 980)
+
+        geo = str(self.ctx.config.get("ui.window_geometry", "") or "").strip()
+        m = re.match(r"^(\d+)x(\d+)(?:([+-]\d+)([+-]\d+))?$", geo)
+        if m:
+            w, h = int(m.group(1)), int(m.group(2))
+            self.resize(min(max(w, 780), 4000), min(max(h, 560), 4000))
+            if m.group(3) is not None:
+                self.move(int(m.group(3)), int(m.group(4)))
+        else:
+            self.resize(default_w, default_h)
+            if avail is not None:
+                self.move(avail.center().x() - default_w // 2,
+                          max(avail.top(), avail.center().y() - default_h // 2))
+        if self.ctx.config.get("ui.window_maximized"):
+            self.setWindowState(Qt.WindowMaximized)
+
+    def _save_geometry(self) -> None:
+        """落盘窗口几何。最大化时只记标志位 —— 记尺寸会把还原尺寸覆盖掉。"""
+        try:
+            cfg = self.ctx.config
+            cfg.set("ui.window_maximized", bool(self.isMaximized()))
+            if not self.isMaximized() and not self.isFullScreen():
+                g = self.geometry()
+                cfg.set("ui.window_geometry",
+                        f"{g.width()}x{g.height()}{g.x():+d}{g.y():+d}")
+            cfg.save()
+        except Exception:  # noqa: BLE001
+            pass
 
     # ================================================================ 构建
 
@@ -131,10 +242,19 @@ class MainWindow(QMainWindow):
 
         root.addWidget(self._header())
 
-        self.tabs = QTabWidget()
         # 页签索引集中登记。以前 _on_toast / _refresh_log 里把 1/2/3 写死，
         # 一插入新页签就会静默错位（提示条跑到别页、日志不再自动刷新）。
+        # ★ 不变量：凡是"跳到某一页"的动作（托盘、命令面板、快捷键、卡片按钮）
+        #   一律走 goto_tab(key)，严禁再出现 setCurrentIndex(<字面量>)。
+        self.tabs = QTabWidget()
         self._tab_index: dict[str, int] = {}
+        self._tab_labels: dict[str, str] = {}
+        self._nav_buttons: dict[str, QPushButton] = {}
+        self._overflow_keys: list[str] = []
+
+        root.addWidget(self._nav_bar())
+        root.addWidget(self.tabs, 1)
+
         for key, label, widget in (
             ("overview", "概览", self._tab_overview()),
             ("admin", "管理台", self._tab_admin()),
@@ -143,14 +263,136 @@ class MainWindow(QMainWindow):
             ("update", "更新", self._tab_update()),
             ("settings", "设置", self._tab_settings()),
         ):
-            self._tab_index[key] = self.tabs.addTab(widget, label)
+            self.add_tab(key, widget, label)
+
+        # 原生 tab bar 退场，交给自绘的分组导航（7 个平铺页签没人扫得完）
+        self.tabs.tabBar().setVisible(False)
         self.tabs.currentChanged.connect(self._on_tab_changed)
-        root.addWidget(self.tabs, 1)
+        self._rebuild_nav()
 
         self.statusBar().showMessage("就绪")
 
+    # ---------------------------------------------------------------- 页签注册
+
+    def add_tab(self, key: str, widget: QWidget, label: str) -> int:
+        """注册一个页签。
+
+        **所有**页签都必须经这里登记（含 app.py 在 _build 之后追加的额度页）——
+        没登记的页签 goto_tab 找不到、快捷键也数不到，就会退化成"必须用鼠标点"。
+        """
+        idx = self.tabs.addTab(widget, label)
+        self._tab_index[key] = idx
+        self._tab_labels[key] = label
+        if getattr(self, "_nav_buttons", None) is not None:
+            self._rebuild_nav()
+        # 页签变了 → Ctrl+1..N 的落点也要跟着重排（否则新页永远没有快捷键）
+        if getattr(self, "_tab_shortcuts", None) is not None:
+            self._bind_tab_shortcuts()
+        return idx
+
+    def tab_label(self, key: str) -> str:
+        return self._tab_labels.get(key, key)
+
+    def tab_key(self, index: int | None = None) -> str:
+        """当前（或指定）索引对应的 key；未知索引返回空串。"""
+        idx = self.tabs.currentIndex() if index is None else index
+        for key, i in self._tab_index.items():
+            if i == idx:
+                return key
+        return ""
+
+    def tab_keys(self) -> list[str]:
+        """按页签**实际顺序**返回 key —— Ctrl+1..N 就按这个顺序排。"""
+        return [k for k, _ in sorted(self._tab_index.items(), key=lambda kv: kv[1])]
+
+    def goto_tab(self, key: str) -> bool:
+        """按 key 切页签（找不到返回 False）。
+
+        这是唯一正确的跨页跳转方式：索引会随页签增删漂移，key 不会。
+        托盘"检查更新"曾经写死 setCurrentIndex(3)，tab 顺序一变就跳到了日志页。
+        """
+        idx = self._tab_index.get(str(key))
+        if idx is None:
+            return False
+        self.tabs.setCurrentIndex(idx)
+        return True
+
+    # ---------------------------------------------------------------- 导航
+
+    def _nav_bar(self) -> QWidget:
+        """顶部导航：主入口按钮 + 「⋯ 更多」+ 命令面板入口。"""
+        bar = QWidget()
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+
+        self._nav_host = QWidget()
+        self._nav_host_row = QHBoxLayout(self._nav_host)
+        self._nav_host_row.setContentsMargins(0, 0, 0, 0)
+        self._nav_host_row.setSpacing(6)
+        row.addWidget(self._nav_host)
+        row.addStretch(1)
+
+        self.btn_more = QPushButton("⋯ 更多")
+        self.btn_more.setObjectName("navMore")
+        self.btn_more.setCursor(Qt.PointingHandCursor)
+        self.btn_more.setToolTip("更新 / 额度消耗 / 设置")
+        row.addWidget(self.btn_more)
+
+        self.btn_palette = QPushButton("Ctrl+K 搜索")
+        self.btn_palette.setObjectName("navMore")
+        self.btn_palette.setCursor(Qt.PointingHandCursor)
+        self.btn_palette.setToolTip("命令面板：搜功能、跳页、换肤，一个框搞定")
+        self.btn_palette.clicked.connect(self._open_palette)
+        row.addWidget(self.btn_palette)
+        return bar
+
+    def _rebuild_nav(self) -> None:
+        """按 _tab_index 重建导航条。页签增删后自动跟上，不用手工维护。"""
+        row = self._nav_host_row
+        while row.count():
+            item = row.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._nav_buttons = {}
+
+        keys = self.tab_keys()
+        primary = [k for k in TAB_PRIMARY if k in self._tab_index]
+        overflow = [k for k in keys if k not in primary]
+
+        for key in primary:
+            btn = QPushButton(self.tab_label(key))
+            btn.setObjectName("navBtn")
+            btn.setCheckable(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda _=False, k=key: self.goto_tab(k))
+            row.addWidget(btn)
+            self._nav_buttons[key] = btn
+
+        self._overflow_keys = overflow
+        menu = QMenu(self)
+        for key in overflow:
+            act = menu.addAction(self.tab_label(key))
+            act.triggered.connect(lambda _=False, k=key: self.goto_tab(k))
+        self._nav_menu = menu          # 持引用，否则菜单会被 GC 掉
+        self.btn_more.setMenu(menu)
+        self.btn_more.setVisible(bool(overflow))
+        self._nav_sync()
+
+    def _nav_sync(self) -> None:
+        """同步导航高亮。收在「更多」里的页，直接把名字显示在按钮上。"""
+        key = self.tab_key()
+        for k, btn in self._nav_buttons.items():
+            btn.setChecked(k == key)
+        more = getattr(self, "btn_more", None)
+        if more is not None:
+            more.setText(f"⋯ {self.tab_label(key)}" if key in self._overflow_keys
+                         else "⋯ 更多")
+
     def _on_tab_changed(self, index: int) -> None:
-        """切到「管理台」时才拉数据 —— 不打扰其它页签，也不空转网络。"""
+        """切页时：同步导航高亮；切到「管理台」才拉数据 —— 不打扰其它页、不空转网络。"""
+        self._nav_sync()
         if index == self._tab_index.get("admin"):
             self.admin.refresh()
 
@@ -221,7 +463,15 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- 概览
 
     def _tab_overview(self) -> QWidget:
-        from .widgets import Card, KeyValue, Separator, Toast
+        from .widgets import (
+            Card,
+            EmptyState,
+            KeyValue,
+            Pill,
+            Separator,
+            StatusRing,
+            Toast,
+        )
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -233,6 +483,61 @@ class MainWindow(QMainWindow):
 
         self.overview_toast = Toast()
         box.addWidget(self.overview_toast)
+
+        # ---- 英雄区 ------------------------------------------------------
+        # 把「状态 / 地址 / 凭证数 / 模型数」压成一眼可见的一屏：
+        # 这四个数就是用户打开窗口 90% 想知道的东西，不该让他去表里翻。
+        hero = Card(object_name="hero")
+        hrow = QHBoxLayout()
+        hrow.setSpacing(18)
+
+        self.hero_ring = StatusRing(96)
+        hrow.addWidget(self.hero_ring, 0, Qt.AlignVCenter)
+
+        hcol = QVBoxLayout()
+        hcol.setSpacing(6)
+        kicker = QLabel("网关状态")
+        kicker.setObjectName("heroKicker")
+        hcol.addWidget(kicker)
+
+        self.hero_title = QLabel("正在检测…")
+        self.hero_title.setObjectName("heroTitle")
+        hcol.addWidget(self.hero_title)
+
+        self.hero_sub = QLabel("")
+        self.hero_sub.setObjectName("mute")
+        self.hero_sub.setWordWrap(True)
+        hcol.addWidget(self.hero_sub)
+
+        pills = QHBoxLayout()
+        pills.setSpacing(6)
+        self.hero_pill_addr = Pill("地址 —", theme.TEXT_DIM)
+        self.hero_pill_port = Pill("端口 —", theme.TEXT_DIM)
+        self.hero_pill_cred = Pill("凭证 —", theme.TEXT_DIM)
+        self.hero_pill_model = Pill("模型 —", theme.TEXT_DIM)
+        for pill in (self.hero_pill_addr, self.hero_pill_port,
+                     self.hero_pill_cred, self.hero_pill_model):
+            pills.addWidget(pill)
+        pills.addStretch(1)
+        hcol.addLayout(pills)
+
+        acts = QHBoxLayout()
+        acts.setSpacing(8)
+        self.hero_btn_start = _btn("启动网关", "primary")
+        self.hero_btn_start.setToolTip("启动 / 停止由萝卜盒托管的网关进程")
+        self.hero_btn_package = _btn("复制接入包", "ghost")
+        self.hero_btn_package.setToolTip(
+            "把本机 / 局域网 / Tailscale / 公网地址、API Key，以及 Codex、\n"
+            "Claude Code 两段配置片段汇成一段 Markdown 复制走（Ctrl+Shift+C）。\n"
+            "省得四个地址一个个复制还漏掉 Key。")
+        acts.addWidget(self.hero_btn_start)
+        acts.addWidget(self.hero_btn_package)
+        acts.addStretch(1)
+        hcol.addLayout(acts)
+
+        hrow.addLayout(hcol, 1)
+        hero.add_layout(hrow)
+        box.addWidget(hero)
 
         # ---- 服务
         card = Card("服务状态", "网关进程由萝卜盒托管，关掉窗口不会中断服务")
@@ -289,7 +594,25 @@ class MainWindow(QMainWindow):
         hh.setSectionResizeMode(0, QHeaderView.Stretch)
         for i in (1, 2, 3):
             hh.setSectionResizeMode(i, QHeaderView.ResizeToContents)
-        cred.add(self.cred_table)
+        hh = self.cred_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        for i in (1, 2, 3):
+            hh.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+
+        # 空池时不再塞一行灰字占位 —— 那看起来像"加载坏了"。
+        # 换成带按钮的空态：直接给出下一步该点哪。
+        self.cred_empty = EmptyState(
+            "凭证池是空的",
+            "网关不会自己产生凭证。到「管理台 → 凭证」扫码或导入 .info 文件，"
+            "加完会自动出现在这里。",
+            glyph="🗝",
+            action=("去添加账号", self._open_credentials_page),
+        )
+        self.cred_stack = QStackedWidget()
+        self.cred_stack.addWidget(self.cred_table)     # 0 = 有数据
+        self.cred_stack.addWidget(self.cred_empty)     # 1 = 空态
+        self.cred_stack.setMinimumHeight(150)
+        cred.add(self.cred_stack)
 
         cred_row = QHBoxLayout()
         self.btn_add_cred = _btn("添加账号（扫码 / 导入）", "primary")
@@ -419,6 +742,8 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- 日志
 
     def _tab_logs(self) -> QWidget:
+        from .widgets import LogHighlighter
+
         page = QWidget()
         box = QVBoxLayout(page)
         box.setContentsMargins(12, 12, 12, 12)
@@ -429,25 +754,39 @@ class MainWindow(QMainWindow):
         self.log_autoscroll.setChecked(True)
         bar.addWidget(self.log_autoscroll)
 
+        self.chk_log_regex = QCheckBox("正则")
+        self.chk_log_regex.setToolTip(
+            "勾上后过滤串按正则解释，例如 ERROR|WARN。\n写错了会自动退回普通的包含匹配。")
+        bar.addWidget(self.chk_log_regex)
+
         bar.addWidget(QLabel("过滤"))
         self.log_filter = QLineEdit()
-        self.log_filter.setPlaceholderText("包含关键字，留空显示全部…")
+        self.log_filter.setPlaceholderText(
+            "包含关键字（或勾「正则」写 ERROR|WARN），留空显示全部…")
+        self.log_filter.setClearButtonEnabled(True)
         bar.addWidget(self.log_filter, 1)
 
         self.btn_log_refresh = _btn("刷新", "ghost", 28)
+        self.btn_log_export = _btn("导出", "ghost", 28)
+        self.btn_log_export.setToolTip("把当前显示的内容导出成 .log 文件")
         self.btn_log_open = _btn("打开文件", "ghost", 28)
         self.btn_log_clear = _btn("清空", "ghost", 28)
-        for b in (self.btn_log_refresh, self.btn_log_open, self.btn_log_clear):
+        for b in (self.btn_log_refresh, self.btn_log_export,
+                  self.btn_log_open, self.btn_log_clear):
             bar.addWidget(b)
         box.addLayout(bar)
 
         self.log_view = QPlainTextEdit()
+        # 配色交给主题里的 QPlainTextEdit#logView —— 以前 inline 写死，
+        # 换到浅色主题后日志区还是一块深色，非常突兀。
+        self.log_view.setObjectName("logView")
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(6000)
-        self.log_view.setStyleSheet(
-            f"background-color: {theme.BG_ALT}; border: 1px solid {theme.BORDER};"
-            f"border-radius: 8px; font-family: {theme.MONO_FAMILY}; font-size: 12px;"
-        )
+        self.log_view.setPlaceholderText(
+            "暂无日志 —— 启动网关后这里会实时滚动。\n"
+            "也可以点右上角「打开文件」直接看 gateway.log。")
+        # ERROR / WARN / INFO 分色：上千行里靠肉眼找错是不现实的
+        self.log_highlighter = LogHighlighter(self.log_view.document())
         box.addWidget(self.log_view, 1)
 
         self.log_meta = QLabel("")
@@ -655,6 +994,36 @@ class MainWindow(QMainWindow):
         net_card.add(warn)
         box.addWidget(net_card)
 
+        # ---- 外观
+        look = Card("外观", "换肤立即生效，不用重启；选择会被记住。")
+        lf = QFormLayout()
+        lf.setLabelAlignment(Qt.AlignRight)
+
+        self.cmb_palette = QComboBox()
+        self.cmb_palette.addItem("深色", "dark")
+        self.cmb_palette.addItem("浅色", "light")
+        lf.addRow("主题基调", self.cmb_palette)
+
+        self.cmb_accent = QComboBox()
+        for key, label in theme.accent_choices():
+            self.cmb_accent.addItem(label, key)
+        lf.addRow("强调色", self.cmb_accent)
+
+        self.cmb_scale = QComboBox()
+        for step, label in zip(theme.SCALE_STEPS, theme.SCALE_LABELS):
+            self.cmb_scale.addItem(f"{label}（{int(step * 100)}%）", float(step))
+        lf.addRow("字号", self.cmb_scale)
+        look.add_layout(lf)
+
+        look_hint = QLabel(
+            "强调色只作用于主按钮、选中态和进度条；"
+            "红 / 黄 / 绿这些状态色是固定语义，不会被换掉 —— "
+            "状态色一旦跟着主题漂，用户就读不出状态了。")
+        look_hint.setObjectName("mute")
+        look_hint.setWordWrap(True)
+        look.add(look_hint)
+        box.addWidget(look)
+
         # ---- 启动与退出
         life = Card("启动与退出")
         self.chk_autostart = QCheckBox("开机自启（登录时启动萝卜盒）")
@@ -690,8 +1059,8 @@ class MainWindow(QMainWindow):
         disk.add(self.lbl_data_size)
 
         self.lbl_disk_warn = QLabel("")
+        self.lbl_disk_warn.setObjectName("warnText")
         self.lbl_disk_warn.setWordWrap(True)
-        self.lbl_disk_warn.setStyleSheet(f"color: {theme.WARN};")
         disk.add(self.lbl_disk_warn)
 
         mrow = QHBoxLayout()
@@ -713,8 +1082,8 @@ class MainWindow(QMainWindow):
 
         if scheduled_task_exists():
             msg = QLabel("检测到旧部署的计划任务 codebuddy2api 仍存在，会和萝卜盒抢同一端口。")
+            msg.setObjectName("warnText")
             msg.setWordWrap(True)
-            msg.setStyleSheet(f"color: {theme.WARN};")
             diag.add(msg)
             self.btn_del_task = _btn("移除旧计划任务", "danger")
             diag.add(self.btn_del_task)
@@ -777,8 +1146,12 @@ class MainWindow(QMainWindow):
         self.btn_claude_restore.clicked.connect(self._restore_claude)
 
         self.btn_log_refresh.clicked.connect(self._refresh_log)
+        self.btn_log_export.clicked.connect(self._export_log)
         self.btn_log_open.clicked.connect(lambda: self._open_path(log_dir()))
         self.btn_log_clear.clicked.connect(self._clear_log)
+        # lambda 包一层：textChanged/toggled 会带参数过来，而 _refresh_log 不收参
+        self.log_filter.textChanged.connect(lambda *_: self._refresh_log())
+        self.chk_log_regex.toggled.connect(lambda *_: self._refresh_log())
 
         self.btn_check_app.clicked.connect(self._check_app_update)
         self.btn_do_app_update.clicked.connect(self._do_app_update)
@@ -797,6 +1170,16 @@ class MainWindow(QMainWindow):
                 b.clicked.connect(self._remove_old_task)
 
         self.chk_funnel.toggled.connect(self._on_funnel_toggled)
+
+        # 英雄区：主按钮 + 复制接入包
+        self.hero_btn_start.clicked.connect(self._toggle_gateway)
+        self.hero_btn_package.clicked.connect(self.copy_access_package)
+
+        # 外观：三个下拉框任一变更都即时换肤
+        for cmb in (self.cmb_palette, self.cmb_accent, self.cmb_scale):
+            cmb.currentIndexChanged.connect(self._on_appearance_changed)
+        self._sync_appearance_widgets()
+
         self._refresh_clients()
 
     # ================================================================ 刷新
@@ -830,15 +1213,58 @@ class MainWindow(QMainWindow):
         self.f_key.set_value(str(ctx.config.get("gateway.api_key", "")))
 
         running = state == "running"
+        reachable = state in ("running", "external")
         self.btn_start.setEnabled(not running and not ctx.runner.busy())
         self.btn_stop.setEnabled(state in ("running", "external", "starting"))
         self.btn_restart.setEnabled(running)
-        self.btn_dashboard.setEnabled(state in ("running", "external"))
-        reachable = state in ("running", "external")
+        self.btn_dashboard.setEnabled(reachable)
         self.btn_add_cred.setEnabled(reachable)
         self.btn_refresh_cred.setEnabled(reachable)
 
+        self._refresh_hero(state, color, base, reachable)
         self._refresh_patch_badge()
+
+    def _refresh_hero(self, state: str, color: str, base: str, reachable: bool) -> None:
+        """首屏英雄区：状态环 + 标题 + 四个 pill + 主按钮。"""
+        label = self.ctx.gateway.state_label
+
+        # 只有真的在跑才呼吸。一直闪着动 = 噪音，"确实活着"这个信号就废了。
+        self.dot.set_breathing(state == "running")
+        self.hero_ring.set_state(STATE_SHORT.get(state, label), color,
+                                 str(self.ctx.config.get("gateway.port")))
+        self.hero_ring.set_breathing(state == "running")
+
+        self.hero_title.setText(label)
+        self.hero_title.setStyleSheet(f"color: {color};")
+        self.hero_sub.setText(
+            f"{base}　·　{'已就绪，可直接接入' if reachable else '未就绪'}")
+
+        self.hero_pill_addr.set_text("地址 已就绪" if reachable else "地址 未就绪",
+                                     theme.OK if reachable else theme.TEXT_MUTE)
+        self.hero_pill_port.set_text(
+            f"端口 {self.ctx.config.get('gateway.port')}", theme.TEXT_DIM)
+
+        creds = getattr(self._last_snap, "credentials", None) or []
+        if creds:
+            good = sum(1 for c in creds if str(c.get("health") or "") == "ready")
+            self.hero_pill_cred.set_text(f"凭证 {good}/{len(creds)}",
+                                         theme.OK if good else theme.WARN)
+        else:
+            self.hero_pill_cred.set_text("凭证 —", theme.TEXT_MUTE)
+
+        models = getattr(self.ctx.health, "models", 0) or 0
+        self.hero_pill_model.set_text(f"模型 {models}" if models else "模型 —",
+                                      theme.OK if models else theme.TEXT_MUTE)
+
+        # 主按钮表达的是"现在该做的那件事"，不是固定标签 —— 运行中就点不了"启动"，
+        # 留着它可点只会让用户误以为状态没刷新。
+        active = state in ("running", "external", "starting")
+        self.hero_btn_start.setText("停止网关" if active else "启动网关")
+        self.hero_btn_start.setObjectName("" if active else "primary")
+        # objectName 变了必须重套样式表，否则 #primary 的强调色配不上
+        self.hero_btn_start.style().unpolish(self.hero_btn_start)
+        self.hero_btn_start.style().polish(self.hero_btn_start)
+        self.hero_btn_start.setEnabled(not self.ctx.runner.busy())
 
     def _refresh_patch_badge(self) -> None:
         rep = self.ctx.patch_status()
@@ -853,20 +1279,34 @@ class MainWindow(QMainWindow):
             self.kv_patch.set_color(theme.OK)
 
     def _on_health(self, snap) -> None:
+        self._last_snap = snap
         self._refresh_state()
         self._fill_credentials(snap)
         self._fill_credits(snap)
 
     def _fill_credentials(self, snap) -> None:
-        rows = snap.credentials or []
-        self.cred_table.setRowCount(len(rows) if rows else 1)
+        rows = getattr(snap, "credentials", None) or []
+        if not rows:
+            # 空态而不是"一行灰字占位"：灰字看起来像加载坏了，
+            # 空态会说明原因并给出下一步按钮。
+            self.cred_table.setRowCount(0)
+            self.cred_empty.set_text(
+                "凭证池是空的" if snap.ok else "暂时读不到凭证池",
+                "到「管理台 → 凭证」扫码或导入 .info 文件，加完会自动出现在这里。"
+                if snap.ok else
+                "网关可能没有在运行 —— 启动网关后这里会自动刷新。")
+            self.cred_stack.setCurrentIndex(1)
+            return
+
+        self.cred_stack.setCurrentIndex(0)
+        self.cred_table.setRowCount(len(rows))
         for r, item in enumerate(rows):
             # 逐行兜底：某一行字段形态异常时只标记这一行，
             # 不能让整个循环中断（早期就是被一个 dict 拖垮了整张表）。
             try:
                 name = str(item.get("name") or item.get("id") or "?")
                 health = str(item.get("health") or "unknown")
-                label, color = HEALTH_LABEL.get(health, (health, theme.TEXT_DIM))
+                label, color = health_label(health)
 
                 self.cred_table.setItem(r, 0, QTableWidgetItem(name))
                 h = QTableWidgetItem(label)
@@ -889,10 +1329,6 @@ class MainWindow(QMainWindow):
                     self.cred_table.setItem(r, 3, QTableWidgetItem("该行数据无法解析"))
                 except Exception:  # noqa: BLE001
                     pass
-        if not rows:
-            self.cred_table.setItem(0, 0, QTableWidgetItem(
-                "暂无凭证" if not snap.ok
-                else "凭证池为空 —— 点下方「添加账号」到管理台扫码添加"))
 
     def _fill_credits(self, snap) -> None:
         credits = snap.credits or {}
@@ -937,26 +1373,259 @@ class MainWindow(QMainWindow):
                 return widget
         return self.overview_toast
 
-    def _refresh_log(self) -> None:
-        if not self.isVisible() or self.tabs.currentIndex() != self._tab_index.get("logs"):
-            return
-        text = self.ctx.gateway.tail_log(int(self.ctx.config.get("ui.log_tail_lines", 800)))
+    def _log_pattern(self) -> re.Pattern | None:
+        """把过滤框编译成正则；没填、没勾正则、或写错了都返回 None。"""
         needle = self.log_filter.text().strip()
-        if needle:
-            text = "\n".join(l for l in text.splitlines() if needle.lower() in l.lower())
+        if not needle or not self.chk_log_regex.isChecked():
+            return None
+        try:
+            return re.compile(needle, re.IGNORECASE)
+        except re.error:
+            # 正则写错不该让日志页变空白 —— 静默退回普通包含匹配，
+            # 并在状态行里说明，用户才知道"为什么没按正则生效"。
+            return None
+
+    def _refresh_log(self) -> None:
+        if not self.isVisible() or self.tab_key() != "logs":
+            return
+        raw = self.ctx.gateway.tail_log(
+            int(self.ctx.config.get("ui.log_tail_lines", 800)))
+        lines = raw.splitlines()
+
+        needle = self.log_filter.text().strip()
+        rx = self._log_pattern()
+        if rx is not None:
+            shown = [ln for ln in lines if rx.search(ln)]
+        elif needle:
+            low = needle.lower()
+            shown = [ln for ln in lines if low in ln.lower()]
+        else:
+            shown = lines
+        text = "\n".join(shown)
+
         bar = self.log_view.verticalScrollBar()
         at_bottom = bar.value() >= bar.maximum() - 4
         if text != self.log_view.toPlainText():
             self.log_view.setPlainText(text)
             if self.log_autoscroll.isChecked() and at_bottom:
                 self.log_view.moveCursor(QTextCursor.End)
+
         path = log_dir() / "gateway.log"
         size = path.stat().st_size if path.is_file() else 0
-        self.log_meta.setText(f"gateway.log　{size / 1024:.1f} KB　{self._log_stamp()}")
+        tally = ""
+        if needle:
+            tally = f"　命中 {len(shown)}/{len(lines)} 行"
+            if self.chk_log_regex.isChecked():
+                tally += "（正则）" if rx is not None else "　⚠ 正则无效，已按普通文本匹配"
+        self.log_meta.setText(
+            f"gateway.log　{size / 1024:.1f} KB　共 {len(lines)} 行{tally}"
+            f"　{self._log_stamp()}")
+
+    def _export_log(self) -> None:
+        """导出当前显示内容（含过滤结果）。文件名带时间戳，两次导出不会互相覆盖。"""
+        text = self.log_view.toPlainText()
+        if not text.strip():
+            self._on_toast("当前没有可导出的日志内容", "warn")
+            return
+        default = str(Path.home()
+                      / f"luobobox-gateway-{time.strftime('%Y%m%d-%H%M%S')}.log")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出日志", default, "日志文件 (*.log);;文本文件 (*.txt)")
+        if not path:
+            return
+        try:
+            Path(path).write_text(text, encoding="utf-8")
+        except OSError as exc:
+            self._on_toast(f"导出失败：{exc}", "error")
+            return
+        self._on_toast(f"已导出 {len(text.splitlines())} 行 → {Path(path).name}", "ok")
+        motion.flash(self.btn_log_export, theme.OK)
 
     @staticmethod
     def _log_stamp() -> str:
         return time.strftime("%H:%M:%S")
+
+    # ================================================================ 快捷键
+
+    def _bind_shortcuts(self) -> None:
+        """窗口级快捷键。
+
+        键位一律沿用编辑器 / 浏览器里的既有习惯，不自创：
+        Ctrl+1..N 切页、F5 刷新、Ctrl+K 命令面板、Ctrl+, 设置。
+
+        ★ 切页的顺序严格跟着 `tab_keys()`，页签增删后自动跟上 ——
+        不会出现"Ctrl+4 以前是日志、现在变成了更新"。
+        """
+        def bind(seq: str, slot) -> None:
+            sc = QShortcut(QKeySequence(seq), self)
+            sc.activated.connect(slot)
+            self._shortcuts.append(sc)
+
+        self._bind_tab_shortcuts()
+
+        bind("Ctrl+K", self._open_palette)
+        bind("Ctrl+R", lambda: self.ctx.restart_gateway())
+        bind("F5", self.refresh_all)
+        bind("Ctrl+Shift+C", self.copy_access_package)
+        bind("Ctrl+,", lambda: self.goto_tab("settings"))
+
+    def _bind_tab_shortcuts(self) -> None:
+        """把 Ctrl+1..N 按**当前**页签顺序重绑。
+
+        ★ 为什么不能只在 __init__ 里绑一次：额度页是 app.py 在 `_build()`
+          **之后**才 add_tab 进来的，绑定时它还不存在 —— 结果是 Ctrl+7 永远
+          绑不上；以后每加一页都会漏一个。所以 add_tab 会回调这里重绑。
+        """
+        for sc in getattr(self, "_tab_shortcuts", []):
+            sc.setEnabled(False)          # 先禁用，避免重绑瞬间两个快捷键同时响应
+            if sc in self._shortcuts:
+                self._shortcuts.remove(sc)
+            sc.deleteLater()
+        self._tab_shortcuts = []
+
+        for i, key in enumerate(self.tab_keys()[:9], start=1):
+            sc = QShortcut(QKeySequence(f"Ctrl+{i}"), self)
+            sc.activated.connect(lambda k=key: self.goto_tab(k))
+            self._shortcuts.append(sc)
+            self._tab_shortcuts.append(sc)
+
+    def _open_palette(self) -> None:
+        from .palette import build_commands, open_palette
+
+        cmd = open_palette(self, build_commands(self))
+        if cmd is None or cmd.run is None:
+            return
+        try:
+            cmd.run()
+        except Exception as exc:  # noqa: BLE001
+            self._on_toast(f"命令执行失败：{type(exc).__name__}：{exc}", "error")
+
+    def refresh_all(self) -> None:
+        """统一刷新入口（F5）：状态 + 客户端 + 日志。"""
+        self.ctx.refresh_health()
+        self._refresh_clients()
+        self._refresh_log()
+        self._on_toast("已刷新", "info")
+
+    def _toggle_gateway(self) -> None:
+        """英雄区那颗主按钮：正在跑就停，否则就启动。"""
+        if self.ctx.quick_state in ("running", "external", "starting"):
+            self.ctx.stop_gateway()
+        else:
+            self.ctx.start_gateway()
+
+    # ================================================================ 接入包
+
+    def access_package(self) -> str:
+        """把接入所需的一切拼成一段 Markdown。
+
+        为什么要"打包"：地址有 4 个（本机 / 局域网 / Tailscale / 公网），
+        加上 Key、再加两段客户端配置 —— 分别复制至少切 6 次窗口，
+        而且极容易漏掉 Key（漏了就会报 401，用户还找不到原因）。
+        汇成一份一次复制走，贴到群里或备忘里就是完整的一份。
+        """
+        cfg = self.ctx.config
+        port = cfg.get("gateway.port")
+        pub = self.ctx.funnel_status.url or (
+            self.ctx.funnel.public_url() if cfg.get("funnel.enabled") else "")
+        return "\n".join([
+            f"# 萝卜盒 LuoboBox {__version__} 接入信息",
+            "",
+            f"- 本机地址：{cfg.base_url()}",
+            f"- 局域网：http://{self._lan_ip()}:{port}",
+            f"- Tailscale：{self._ts_url()}",
+            f"- 公网入口：{pub or '未开启'}",
+            f"- API Key：`{cfg.get('gateway.api_key', '')}`",
+            "",
+            "## Codex（写入 config.toml）",
+            "",
+            "```toml",
+            snippet_codex(cfg, with_key=True).strip(),
+            "```",
+            "",
+            "## Claude Code / Anthropic 兼容客户端",
+            "",
+            "```bash",
+            snippet_claude(cfg).strip(),
+            "```",
+            "",
+        ])
+
+    def copy_access_package(self) -> None:
+        text = self.access_package()
+        QApplication.clipboard().setText(text)
+        self._on_toast(f"接入包已复制到剪贴板（Markdown，{len(text)} 字符）", "ok")
+        motion.flash(self.hero_btn_package, theme.OK)
+
+    def copy_api_key(self) -> None:
+        QApplication.clipboard().setText(
+            str(self.ctx.config.get("gateway.api_key", "")))
+        self._on_toast("API Key 已复制到剪贴板", "ok")
+
+    # ================================================================ 外观
+
+    def _on_appearance_changed(self, *_args) -> None:
+        self.apply_appearance(
+            palette=self.cmb_palette.currentData(),
+            accent=self.cmb_accent.currentData(),
+            scale=float(self.cmb_scale.currentData()),
+        )
+
+    def apply_appearance(self, palette=None, accent=None, scale=None,
+                         announce: bool = True) -> None:
+        """换肤 + 落盘。设置页与命令面板都走这里 —— 只有一处实现。
+
+        顺序不能反：先改 theme 的当前值 → 再重出样式表 →
+        最后回刷那些把颜色"抠"进内联样式的控件。
+        漏掉最后一步，磁盘告警这类用 setStyleSheet 上色的地方
+        会停在旧配色上（浅色主题里一块深橙）。
+        """
+        theme.apply(palette=palette, accent=accent, scale=scale)
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(theme.stylesheet())
+
+        cur = theme.current()
+        cfg = self.ctx.config
+        cfg.set("ui.palette", cur["palette"])
+        cfg.set("ui.accent", cur["accent"])
+        cfg.set("ui.scale", cur["scale"])
+        cfg.save()
+
+        self._sync_appearance_widgets()
+        if announce:
+            scale_label = dict(zip(theme.SCALE_STEPS, theme.SCALE_LABELS)).get(
+                cur["scale"], "标准")
+            self._on_toast(
+                "外观已更新：{} / {} / {}".format(
+                    "深色" if cur["palette"] == "dark" else "浅色",
+                    theme.ACCENTS[cur["accent"]]["label"], scale_label),
+                "ok")
+
+    @staticmethod
+    def _select_data(combo: QComboBox, value) -> None:
+        """按用户数据选中下拉项（blockSignals，避免换肤又触发一次换肤）。"""
+        combo.blockSignals(True)
+        for i in range(combo.count()):
+            if combo.itemData(i) == value:
+                combo.setCurrentIndex(i)
+                break
+        combo.blockSignals(False)
+
+    def _sync_appearance_widgets(self) -> None:
+        """把换肤结果同步到下拉框与内联着色的控件。"""
+        if getattr(self, "cmb_palette", None) is not None:
+            self._select_data(self.cmb_palette, theme.palette_name())
+            self._select_data(self.cmb_accent, theme.accent_name())
+            self._select_data(self.cmb_scale, float(theme.scale()))
+
+        self._refresh_state()
+        if self._last_snap is not None:
+            self._fill_credentials(self._last_snap)
+        self._refresh_clients()
+        for toast in (self.overview_toast, self.client_toast, self.update_toast):
+            toast.repaint_theme()
+        self.update()
 
     # ================================================================ 动作
 
@@ -979,10 +1648,8 @@ class MainWindow(QMainWindow):
 
     def _open_credentials_page(self) -> None:
         """账号只在管理台里添加 —— 直接切到「管理台 → 凭证」，省得用户找。"""
-        index = self._tab_index.get("admin")
-        if index is None:
+        if not self.goto_tab("admin"):
             return
-        self.tabs.setCurrentIndex(index)
         self.admin.show_credentials_tab()
 
     def _open_path(self, path) -> None:
@@ -1104,11 +1771,13 @@ class MainWindow(QMainWindow):
             self.kv_app_remote.set_value(info.tag or "未知")
             self.kv_app_local.set_value(info.local_version or __version__)
             if info.newer:
+                self.set_update_badge("app", f"萝卜盒 {info.tag}")
                 self._on_toast(f"萝卜盒有新版本 {info.tag}（当前 {__version__}）", "warn")
                 self.app_update_notes.setPlainText(
                     f"{info.name}\n发布于 {info.published}\n\n{info.notes}")
                 self.btn_do_app_update.setEnabled(True)
             else:
+                self.set_update_badge("app", "")
                 self._on_toast(f"萝卜盒已是最新（{__version__}）", "ok")
                 self.app_update_notes.setPlainText("当前已是最新版本。")
                 self.btn_do_app_update.setEnabled(False)
@@ -1210,11 +1879,13 @@ class MainWindow(QMainWindow):
             self.kv_remote_ver.set_value(info.tag or "未知")
             self.kv_local_ver.set_value(info.local_version or "未知")
             if info.newer:
+                self.set_update_badge("gateway", f"网关 {info.tag}")
                 self._on_toast(f"发现新版本 {info.tag}（当前 {info.local_version}）", "warn")
                 self.update_notes.setPlainText(
                     f"{info.name}\n发布于 {info.published}\n\n{info.notes}")
                 self.btn_do_update.setEnabled(True)
             else:
+                self.set_update_badge("gateway", "")
                 self._on_toast(f"已是最新（{info.local_version or info.tag}）", "ok")
                 self.update_notes.setPlainText("当前版本已是最新。")
                 self.btn_do_update.setEnabled(False)
@@ -1548,6 +2219,9 @@ class MainWindow(QMainWindow):
         self._force_quit = True
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        # 无论后面是"收进托盘"还是"真退出"，窗口几何都先落盘 ——
+        # 收进托盘之后用户下次回来，看到的还应该是他调好的那个大小。
+        self._save_geometry()
         tray_exists = getattr(QApplication.instance(), "tray", None) is not None
         if (self.ctx.config.get("app.minimize_to_tray") and tray_exists
                 and not self._pending_quit and not getattr(self, "_force_quit", False)):

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -159,3 +159,49 @@ def summary(data: dict) -> dict:
         "rate": rate,
         "accounts": len(accounts),
     }
+
+
+def _next_day_value(daily: dict, day: str, all_dates: list[str]) -> Optional[float]:
+    """`all_dates` 里排在 day 之后最近那天的首次余额（没有更新的一天就返回 None）。"""
+    later = [d for d in all_dates if d > day]
+    if not later:
+        return None
+    value = daily.get(later[0])
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def daily_series(data: dict, days: int = 7) -> list[tuple[str, float]]:
+    """最近 N 天每天的消耗，按日期升序返回 [(YYYY-MM-DD, 消耗), ...]。
+
+    推导方式：某天消耗 = 当天首次余额 − 次日首次余额；
+    最后一天（今天）用 `last_balance` 收尾。
+
+    为什么能这样算：`daily` 里存的是"当天第一次看到的余额"，
+    所以相邻两天的差值恰好是这中间用掉的量。跨天若发生充值，
+    差额会是负数 —— clamp 到 0。宁可少算，不可虚报消耗。
+    """
+    accounts = data.get("accounts", {})
+    all_dates = sorted({d for rec in accounts.values()
+                        for d in (rec.get("daily") or {})})
+
+    today = date.today()
+    window = [(today - timedelta(days=i)).isoformat()
+              for i in range(days - 1, -1, -1)]
+
+    out: list[tuple[str, float]] = []
+    for day in window:
+        total = 0.0
+        for rec in accounts.values():
+            daily = rec.get("daily") or {}
+            if day not in daily:
+                continue
+            start = daily[day]
+            if not isinstance(start, (int, float)):
+                continue
+            end = _next_day_value(daily, day, all_dates)
+            if end is None:
+                end = rec.get("last_balance")
+            if isinstance(end, (int, float)):
+                total += max(0.0, float(start) - float(end))
+        out.append((day, total))
+    return out

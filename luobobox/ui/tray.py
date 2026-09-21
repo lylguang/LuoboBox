@@ -22,6 +22,9 @@ ICON_FILES = {
     "stopped": "tray_off.png",
 }
 
+# 菜单项默认文案；发现新版本时会改写成「… · 有新版本（…）」
+UPDATE_MENU_TEXT = "检查更新（萝卜盒 / 网关）"
+
 
 class TrayController(QObject):
 
@@ -30,6 +33,9 @@ class TrayController(QObject):
         self.app = app
         self.ctx = ctx
         self.window = window
+        # 角标文案：既接住窗口**后续**的回调，也接住"托盘创建**之前**
+        # 就已经检查出更新"的情况（那种情况下窗口属性已经有值、回调却不会再来）。
+        self._badge = str(getattr(window, "update_badge", "") or "")
 
         self.tray = QSystemTrayIcon(self._icon("stopped"), app)
         self.tray.setToolTip(f"萝卜盒 {__version__}")
@@ -38,6 +44,11 @@ class TrayController(QObject):
         self.tray.setContextMenu(self.menu)
         self.tray.activated.connect(self._on_activated)
         self.tray.show()
+
+        # 发现新版本时主窗口会回调过来 —— 托盘是这类工具的"主界面"，
+        # 新版本必须在不打开窗口的情况下就能看见（否则用户永远不知道要更新）。
+        if hasattr(window, "on_update_found"):
+            window.on_update_found(self._on_update_found)
 
         ctx.state_changed.connect(self.refresh)
         ctx.toast.connect(self._notify)
@@ -98,11 +109,16 @@ class TrayController(QObject):
         self.act_copy_key.triggered.connect(self._copy_key)
         m.addAction(self.act_copy_key)
 
+        self.act_package = QAction("复制接入包（Markdown）", m)
+        self.act_package.triggered.connect(self.window.copy_access_package)
+        m.addAction(self.act_package)
+
         self.act_checkin = QAction("立即签到", m)
         self.act_checkin.triggered.connect(self._checkin)
         m.addAction(self.act_checkin)
 
-        self.act_update = QAction("检查更新（萝卜盒 / 网关）", m)
+        self.act_update = QAction(
+            f"检查更新 · 有新版本（{self._badge}）" if self._badge else UPDATE_MENU_TEXT, m)
         self.act_update.triggered.connect(self._check_update)
         m.addAction(self.act_update)
         m.addSeparator()
@@ -136,7 +152,17 @@ class TrayController(QObject):
         self.act_autostart.blockSignals(False)
 
         self.tray.setIcon(self._icon(state))
-        self.tray.setToolTip(f"萝卜盒 · {label}")
+        tip = f"萝卜盒 · {label}"
+        if self._badge:
+            tip += f" · 有新版本：{self._badge}"
+        self.tray.setToolTip(tip)
+
+    def _on_update_found(self, text: str) -> None:
+        """主窗口发现新版本 → 菜单项直接写出来 + tooltip 带角标。"""
+        self._badge = (text or "").strip()
+        self.act_update.setText(
+            f"检查更新 · 有新版本（{self._badge}）" if self._badge else UPDATE_MENU_TEXT)
+        self.refresh()
 
     def _notify(self, text: str, level: str) -> None:
         if level == "error":
@@ -172,7 +198,14 @@ class TrayController(QObject):
         self.window._checkin()  # noqa: SLF001
 
     def _check_update(self) -> None:
-        self.window.tabs.setCurrentIndex(3)
+        """跳到「更新」页并跑两条更新链路。
+
+        ★ 这里以前是 `self.window.tabs.setCurrentIndex(3)` ——
+        但页签实际顺序是 概览0 / 管理台1 / 客户端2 / 日志3 / 更新4 / 设置5，
+        于是点"检查更新"会跳到**日志**页，用户完全不知道发生了什么。
+        索引会随页签增删漂移，key 不会：一律走 goto_tab。
+        """
+        self.window.goto_tab("update")
         self._show_window()
         # 两条独立的更新链路：萝卜盒自己 + 网关
         self.window._check_app_update()  # noqa: SLF001

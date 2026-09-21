@@ -71,7 +71,11 @@ def main() -> int:
         log(f"     {line}")
 
     log("[6] 构建 MainWindow…")
+    from luobobox import usage_view
+
     win = MainWindow(ctx)
+    # 模拟 app.py：额度页是 _build 之后追加的（这里补上，否则最新的一页永远拍不到）
+    win.add_tab("usage", usage_view.build_usage_tab(ctx), "额度消耗")
     win.resize(960, 760)
     win.show()
     pump(app, 10)
@@ -80,7 +84,9 @@ def main() -> int:
     log(f"    页签：{tabs}")
 
     for i, name in enumerate(tabs):
-        win.tabs.setCurrentIndex(i)
+        # 走 goto_tab(key) 而不是 setCurrentIndex(i)：顶部导航的高亮/「⋯ 更多」
+        # 文案是靠切页信号同步的，绕过去截图就会拍到"导航没跟上"的假象。
+        win.goto_tab(win.tab_key(i))
         pump(app, 6)
         path = OUT / f"{i + 1:02d}_{name}.png"
         ok = win.grab().save(str(path))
