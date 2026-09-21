@@ -109,6 +109,25 @@ def make_icon() -> None:
     subprocess.run([sys.executable, str(PACKAGING / "make_icon.py")], check=True)
 
 
+def check_bundled_webui() -> bool:
+    """确认内置 WebUI 在库。
+
+    这是「/dashboard/ 永不 503」的唯一保证：上游 Release 从不带 web/dist，
+    目标机器也未必有 Node 工具链，所以只能靠萝卜盒自带一份。
+    缺了它包照样能打出来，但用户点「网页版管理台」就会看到 503 —— 属于
+    「构建成功、功能静默降级」，比构建失败更难发现，所以这里直接拦住。
+
+    返回是否就位。
+    """
+    index = ROOT / "assets" / "webui" / "index.html"
+    if index.is_file():
+        n = sum(1 for p in (ROOT / "assets" / "webui").rglob("*") if p.is_file())
+        size = sum(p.stat().st_size for p in (ROOT / "assets" / "webui").rglob("*") if p.is_file())
+        log(f"内置 WebUI 就位：{n} 个文件，{human(size)}")
+        return True
+    return False
+
+
 def clean() -> None:
     """报告上一次的产物。
 
@@ -315,6 +334,8 @@ def main() -> int:
     ap.add_argument("--installer", action="store_true", help="同时生成安装包")
     ap.add_argument("--zip", action="store_true", help="同时生成便携版 zip")
     ap.add_argument("--no-selftest", action="store_true", help="跳过产物自检")
+    ap.add_argument("--allow-missing-webui", action="store_true",
+                    help="允许在没有内置 WebUI 的情况下打包（会导致 /dashboard/ 503）")
     args = ap.parse_args()
 
     version = read_version()
@@ -328,6 +349,16 @@ def main() -> int:
         clean()
 
     make_icon()
+    if not check_bundled_webui():
+        msg = ("assets/webui/ 不存在 —— 打出来的包点「网页版管理台」会 503。\n"
+               "  先构建网关 WebUI，再同步进来：\n"
+               "    在网关的 web/ 下：node_modules\\.bin\\vp.CMD build\n"
+               "    python packaging/sync_webui.py\n"
+               "  确实要打一个不带内置 WebUI 的包，加 --allow-missing-webui。")
+        if args.allow_missing_webui:
+            log("⚠ " + msg)
+        else:
+            raise SystemExit(msg)
     write_version_info(version)
     staged = run_pyinstaller(build_id)
     swap_into_place(staged / "LuoboBox", DIST / "LuoboBox", build_id)

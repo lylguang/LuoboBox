@@ -173,11 +173,15 @@ python tests/appupdater_selftest.py
 # 否则网页版管理台会因缺构建产物而 503「WebUI 尚未构建」
 python tests/updater_preserve_selftest.py
 
+# 内置 WebUI 自测（34 项）：dist 缺失时补齐、幂等、绝不覆盖用户自建产物、
+# 版本戳过时刷新、没内置/目录不存在时不炸、apply_release 端到端补上 dist
+python tests/webui_selftest.py
+
 # 发版后校验（可选，需联网，会下载 ~50MB）：
 # 真下 GitHub Release 的便携包，覆盖一份 dist/LuoboBox 老安装，
 # 断言 exe 的 ProductVersion 真的换了代、包内文件无一缺失且字节一致
 python tests/e2e_release_asset.py          # 校验 latest
-python tests/e2e_release_asset.py v1.0.2   # 校验指定 tag
+python tests/e2e_release_asset.py v1.0.3   # 校验指定 tag
 ```
 
 自测重点覆盖两个**静默出错**的地方：
@@ -253,9 +257,21 @@ Key 轮换后要重新执行一次「接入 Codex」（它会重写 `config.toml
   - **原生「管理台」页签**（推荐）：直接调网关 `/admin/*` REST，**不依赖 `web/dist`**，
     所以网关怎么升级都不会坏；
   - **网页版**：网关自带的 `/dashboard/`，需要 `codebuddy2api/web/dist` 构建产物。
-    上游 Release 不含 `dist`，因此升级时会保留本地 `web/dist`（见 `updater.PRESERVE_SUBPATHS`），
-    否则 `/dashboard/` 会 503「WebUI 尚未构建」。
+    上游 Release 不含 `dist`（`web/.gitignore` 把它忽略了），而覆盖动作是
+    「整目录 rmtree + copytree」——所以**每次升级都会把它冲掉**。
+    两道防线：
+    1. `updater.PRESERVE_SUBPATHS`：升级时把已有的 `web/dist`、`web/node_modules`
+       搬到同盘暂存、覆盖完再搬回（防「被删掉」）；
+    2. **内置 WebUI**（`luobobox/webui.py` + `assets/webui/`）：萝卜盒自己带一份
+       预构建 `dist`，在「网关升级后 / 萝卜盒启动时 / 点网页版管理台时」三个时机
+       按需补齐（防「从没构建过」和「上游改了 web/src 导致 dist 过时」）。
+       只在 `dist` 缺失、或带萝卜盒的版本戳且已过期时才写；**用户自行构建的
+       `dist`（无版本戳）绝不覆盖**。
   两者都省掉了 ~100MB 的 QtWebEngine。
+
+  维护内置 WebUI：在网关的 `web/` 下 `node_modules\.bin\vp.CMD build`，
+  然后 `python packaging/sync_webui.py`（把产物同步进 `assets/webui/` 并入库）。
+  `build.py` 会在 `assets/webui/` 缺失时直接报错 —— 免得打出「点开就 503」的包。
 - 账号风控、上游 ToS、公网暴露风险与原项目一致，萝卜盒不改也不规避这些。
 
 ---

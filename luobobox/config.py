@@ -235,7 +235,9 @@ class Config:
         return f"http://{host}:{int(self.get('gateway.port', 8788))}"
 
     def dashboard_url(self) -> str:
-        return self.base_url() + "/dashboard"
+        # 末尾斜杠不能省：前端 vite.config.ts 里 base 是 "/dashboard/"，
+        # 网关也是按 /dashboard/ 挂载的。不带斜杠会先吃一次 307 跳转。
+        return self.base_url() + "/dashboard/"
 
 
 # ---------------------------------------------------------------- 工具

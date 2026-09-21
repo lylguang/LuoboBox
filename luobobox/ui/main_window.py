@@ -871,6 +871,20 @@ class MainWindow(QMainWindow):
     # ================================================================ 动作
 
     def _open_dashboard(self) -> None:
+        """打开网页版管理台。
+
+        上游 Release 从不带 web/dist，升级网关就会把它冲掉 → /dashboard/ 503。
+        这里现场自愈：先用萝卜盒内置的预构建 dist 补齐，再开浏览器。
+        拷贝只有几百 KB，同步做掉即可，不必走后台线程。
+        """
+        try:
+            from .. import webui
+
+            rep = webui.ensure(self.ctx.config.get("gateway.dir"))
+            if rep.changed:
+                self._on_toast(f"网页版管理台：{rep.message}", "ok")
+        except Exception:  # noqa: BLE001
+            pass
         QDesktopServices.openUrl(QUrl(self.ctx.config.dashboard_url()))
 
     def _open_credentials_page(self) -> None:
@@ -1136,7 +1150,8 @@ class MainWindow(QMainWindow):
         updater.cleanup_downloads()
         if not res.ok:
             return res.message
-        return f"{res.message}；脱敏补丁：{res.patched}。请重启网关使改动生效。"
+        return (f"{res.message}；脱敏补丁：{res.patched}；"
+                f"网页版管理台：{res.webui}。请重启网关使改动生效。")
 
     # ---------------------------------------------------------- 设置
 
@@ -1311,6 +1326,17 @@ class MainWindow(QMainWindow):
 
         if not is_gateway_dir(self.ctx.config.get("gateway.dir")):
             self._on_toast("网关目录无效，请到「设置」里指定 codebuddy2api 源码目录", "error")
+            return
+
+        # 启动时补齐内置 WebUI —— 覆盖「升级后没重启过」「dist 从没构建过」等情况
+        try:
+            from .. import webui
+
+            rep = webui.ensure(self.ctx.config.get("gateway.dir"))
+            if rep.changed:
+                self._on_toast(f"网页版管理台：{rep.message}", "ok")
+        except Exception:  # noqa: BLE001
+            pass
 
     # ================================================================ 关闭
 

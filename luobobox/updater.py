@@ -155,6 +155,7 @@ class ApplyResult:
     message: str = ""
     backup: Path | None = None
     patched: str = ""
+    webui: str = ""
 
 
 def apply_release(gateway_dir: Path | str, archive: Path) -> ApplyResult:
@@ -241,6 +242,17 @@ def apply_release(gateway_dir: Path | str, archive: Path) -> ApplyResult:
         result.patched = rep.summary()
     except Exception as exc:  # noqa: BLE001
         result.patched = f"重打补丁时出错，请手动检查：{exc}"
+
+    # 5) 补齐内置 WebUI。
+    # PRESERVE_SUBPATHS 只能保住「升级前就已经构建好的」dist；全新机器、
+    # 或上游改了 web/src 的情况它无能为力。萝卜盒自带一份预构建 dist，
+    # 这里按需补齐 —— 否则 /dashboard/ 立刻 503「WebUI 尚未构建」。
+    try:
+        from . import webui
+
+        result.webui = webui.ensure(gw).message
+    except Exception as exc:  # noqa: BLE001
+        result.webui = f"部署内置 WebUI 时出错：{exc}"
 
     result.ok = True
     return result

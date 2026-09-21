@@ -161,10 +161,8 @@ class TrayController(QObject):
         self.window.activateWindow()
 
     def _open_dashboard(self) -> None:
-        from PySide6.QtCore import QUrl
-        from PySide6.QtGui import QDesktopServices
-
-        QDesktopServices.openUrl(QUrl(self.ctx.config.dashboard_url()))
+        # 交给主窗口做：那边会先用内置 dist 补齐 /dashboard/ 再开浏览器
+        self.window._open_dashboard()  # noqa: SLF001
 
     def _copy_key(self) -> None:
         QApplication.clipboard().setText(str(self.ctx.config.get("gateway.api_key", "")))

@@ -37,7 +37,13 @@ jobs:
       - name: 安装 Inno Setup
         run: choco install innosetup -y --no-progress
 
-      # assets/ 未入库（图标由 make_icon.py 生成），build.py 会自动补生成。
+      # 内置 WebUI 是「/dashboard/ 永不 503」的前提。它由 packaging/sync_webui.py
+      # 从网关构建产物同步而来并入库 —— CI 里没有 Node 工具链、也拿不到网关源码，
+      # 所以构建不出来，只能靠入库。这里先卡一道，避免发出没有内置 WebUI 的包。
+      - name: 校验内置 WebUI 存在
+        run: python packaging/sync_webui.py --check
+
+      # assets/ 里的图标等资源已入库；icon.ico 缺失时 build.py 会用 make_icon.py 补生成。
       # 跳过 --selftest：它会拉起 QApplication，在无桌面会话的 runner 上没有意义。
       - name: 打包（便携版 + 安装包）
         run: python packaging/build.py --zip --installer --no-selftest
