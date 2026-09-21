@@ -100,6 +100,30 @@ def main() -> int:
         log(f"    截图 {'OK ' if ok else 'FAIL'} {path.name}")
     wiz.close()
 
+    # 8b. 干净机器场景：探测不到 Python 时，"下载安装包"入口必须自动浮出来。
+    #     不模拟的话这条分支永远只跑在真·没装 Python 的用户机器上，改坏了没人发现。
+    log("[8b] 向导 · 无 Python（下载入口应自动出现）…")
+    import luobobox.ui.wizard as _wz
+
+    _orig_find = _wz.find_python
+    _wz.find_python = lambda preferred=None: (  # noqa: ARG005
+        None,
+        [
+            (Path(r"C:\Python313\python.exe"), "文件不存在"),
+            (Path(r"C:\Program Files\Python312\python.exe"), "缺依赖：fastapi、uvicorn"),
+        ],
+    )
+    wiz_bare = FirstRunWizard(ctx, None)
+    wiz_bare.resize(700, 620)
+    wiz_bare.show()
+    wiz_bare._goto(1)  # noqa: SLF001
+    pump(app, 8)
+    ok = wiz_bare.grab().save(str(OUT / "12b_向导_运行环境_未找到Python.png"))
+    log(f"    截图 {'OK ' if ok else 'FAIL'} 12b_向导_运行环境_未找到Python.png")
+    log(f"    下载提示可见 = {wiz_bare.py_dl_tip.isVisible()}（应为 True）")
+    wiz_bare.close()
+    _wz.find_python = _orig_find
+
     ctx.stop_timers()
     win.hide()
     pump(app, 3)

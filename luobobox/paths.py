@@ -317,6 +317,13 @@ def is_gateway_dir(path: Path | str) -> bool:
 
 REQUIRED_MODULES = ("fastapi", "uvicorn", "httpx")
 
+# 本机没有 Python 时的下载入口（向导 / 设置页共用）。
+# 只放"页面"而不是某个具体版本的下载直链 —— 写死版本号迟早变成 404。
+PYTHON_DOWNLOADS: tuple[tuple[str, str], ...] = (
+    ("官方下载", "https://www.python.org/downloads/windows/"),
+    ("国内镜像", "https://mirrors.huaweicloud.com/python/"),
+)
+
 
 def _candidate_interpreters() -> list[Path]:
     """按优先级列出候选解释器。"""

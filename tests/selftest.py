@@ -90,7 +90,15 @@ def test_config(work: Path) -> None:
 
 def test_paths(work: Path) -> None:
     print("\n[2] 环境探测")
-    from luobobox.paths import find_python, is_gateway_dir, pythonw_for
+    from luobobox.paths import PYTHON_DOWNLOADS, find_python, is_gateway_dir, pythonw_for
+
+    # 向导 / 设置页会把这两个链接直接摆给用户，写成死链就是把人往坑里带。
+    # 只允许"页面"级链接（版本号写死迟早 404）。
+    check("Python 下载入口非空且均为 https 页面",
+          len(PYTHON_DOWNLOADS) >= 2
+          and all(label and url.startswith("https://") and not url.endswith(".exe")
+                  for label, url in PYTHON_DOWNLOADS),
+          str(PYTHON_DOWNLOADS))
 
     py, report = find_python()
     check("找到可用解释器", py is not None, "探测报告为空" if not report else str(report[:2]))

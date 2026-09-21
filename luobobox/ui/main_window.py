@@ -567,7 +567,7 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- 设置
 
     def _tab_settings(self) -> QWidget:
-        from .widgets import Card
+        from .widgets import Card, python_download_tip
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -601,6 +601,10 @@ class MainWindow(QMainWindow):
         pw = QWidget()
         pw.setLayout(py_row)
         form.addRow("解释器", pw)
+        # 同向导：默认隐藏，探测不到才浮出来。
+        self.py_dl_tip = python_download_tip()
+        self.py_dl_tip.setVisible(False)
+        form.addRow("", self.py_dl_tip)
 
         self.in_port = QSpinBox()
         self.in_port.setRange(1, 65535)
@@ -1273,20 +1277,29 @@ class MainWindow(QMainWindow):
 
         def work():
             py, report = find_python(self.in_python.text().strip() or None)
+            # 与向导同款：不存在的候选折成一行计数，别把真正有用的失败原因冲掉。
             lines = []
-            for cand, why in report[:12]:
+            missing = 0
+            for cand, why in report:
+                if why == "文件不存在":
+                    missing += 1
+                    continue
                 mark = "✓" if why == "可用" else "✗"
                 lines.append(f"{mark} {cand}   {why}")
-            return py, "\n".join(lines)
+            if missing:
+                lines.append(f"（另有 {missing} 个候选路径不存在，已省略）")
+            return py, "\n".join(lines[:12]) or "未发现任何 Python 解释器。"
 
         def done(res):
             py, report = res
             self.diag_out.setPlainText(report)
+            self.py_dl_tip.setVisible(py is None)
             if py:
                 self.in_python.setText(str(py))
                 self._on_toast(f"选中解释器：{py}", "ok")
             else:
-                self._on_toast("没有找到带 fastapi/uvicorn/httpx 的 Python", "error")
+                self._on_toast("没有找到带 fastapi/uvicorn/httpx 的 Python，"
+                               "可点「解释器」下方的下载链接装一个", "error")
 
         self.ctx.run_task(work, done,
                           lambda m: self.diag_out.setPlainText(f"探测失败：{m}"))

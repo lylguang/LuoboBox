@@ -232,6 +232,15 @@ class FirstRunWizard(QDialog):
         pw.setLayout(py_row)
         form.addRow("Python", pw)
 
+        # 探测失败时的兜底入口：直接把下载地址摆在眼前，别让用户自己去搜。
+        # 默认藏起来 —— 本机 Python 好使的用户不该被"没装 Python？"打扰，
+        # 进这一页会自动探测，命中就保持隐藏，没命中才浮出来。
+        from .widgets import python_download_tip
+
+        self.py_dl_tip = python_download_tip()
+        self.py_dl_tip.setVisible(False)
+        form.addRow("", self.py_dl_tip)
+
         self.w_port = QSpinBox()
         self.w_port.setRange(1, 65535)
         self.w_port.setValue(int(self.ctx.config.get("gateway.port", 8788)))
@@ -387,7 +396,7 @@ class FirstRunWizard(QDialog):
             self._warn("网关目录里找不到 converter.py，请确认目录是否正确。")
             return False
         if not Path(self.w_py.text().strip()).exists():
-            self._warn("Python 解释器路径不存在，请点「自动探测」。")
+            self._warn("Python 解释器路径不存在，请点「自动探测」，或从下方链接下载安装。")
             return False
         port = int(self.w_port.value())
         if not port_free(port):
@@ -409,14 +418,31 @@ class FirstRunWizard(QDialog):
 
         QApplication.processEvents()
         py, report = find_python(self.w_py.text().strip() or None)
-        lines = [f"{'✓' if why == '可用' else '✗'} {cand}   {why}" for cand, why in report[:8]]
-        self.probe_out.setText("\n".join(lines))
+        # 候选里绝大多数是"这台机器上根本没这个路径"，全列出来只会淹没有用信息，
+        # 折成一行计数；真正被检查过但不合格的（缺依赖 / 调用失败）才逐条显示。
+        lines: list[str] = []
+        missing = 0
+        for cand, why in report:
+            if why == "文件不存在":
+                missing += 1
+                continue
+            lines.append(f"{'✓' if why == '可用' else '✗'} {cand}   {why}")
+        if missing:
+            lines.append(f"（另有 {missing} 个候选路径不存在，已省略）")
+        self.probe_out.setText("\n".join(lines[:8]) or "未发现任何 Python 解释器。")
         if py:
+            self.py_dl_tip.setVisible(False)
             self.w_py.setText(str(py))
             self.hint.setStyleSheet(f"color: {theme.OK};")
             self.hint.setText(f"已选中可用解释器：{py}")
+            return
+        # 没探到才把下载入口亮出来（这就是"自动适配"：有 Python 时界面不留噪音）。
+        self.py_dl_tip.setVisible(True)
+        # 失败分两种：装了但缺依赖 vs 压根没装 —— 两者下一步动作完全不同。
+        if any(why.startswith(("缺依赖", "调用失败")) for _, why in report):
+            self._warn("找到 Python 但缺少依赖，请执行 pip install fastapi uvicorn httpx 后重试。")
         else:
-            self._warn("没找到带 fastapi / uvicorn / httpx 的 Python。")
+            self._warn("这台机器上没找到 Python，点 Python 下方的「下载安装包」链接装一个。")
 
     def _port_changed(self, value: int) -> None:
         if not port_free(value):

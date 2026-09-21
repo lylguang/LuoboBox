@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import platform
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath
 from PySide6.QtWidgets import (
@@ -246,6 +249,75 @@ class Separator(QFrame):
         self.setObjectName("separator")
         self.setFixedHeight(1)
         self.setFrameShape(QFrame.NoFrame)
+
+
+def link_label(text: str, url: str, color: str = theme.INFO) -> QLabel:
+    """一行外链标签：蓝色下划线 + 手型光标，点击交给系统浏览器。
+
+    用 QLabel 富文本而不是 QPushButton —— 按钮会抢视线（这里只是备注性的入口），
+    而且 `setOpenExternalLinks(True)` 是 Qt 官方路子，不用自己处理 QUrl。
+    """
+    lbl = QLabel(
+        f'<a href="{url}" style="color:{color};text-decoration:underline;">{text}</a>'
+    )
+    lbl.setOpenExternalLinks(True)
+    lbl.setTextInteractionFlags(Qt.TextBrowserInteraction)
+    lbl.setCursor(Qt.PointingHandCursor)
+    lbl.setToolTip(url)
+    return lbl
+
+
+def _python_arch_label() -> str:
+    """按本机 CPU 架构给出该下哪种安装包。
+
+    装错位数是"装完还是用不了"的头号原因（32 位包里没有真解释器）。
+    环境变量优先于 platform.machine()：后者在个别精简/虚拟化环境下
+    会返回空串或 "x86"，反而是错的。
+    """
+    machine = (os.environ.get("PROCESSOR_ARCHITECTURE") or platform.machine() or "").lower()
+    return "Windows ARM64" if machine == "arm64" else "Windows x86-64"
+
+
+def python_download_tip() -> QWidget:
+    """「没装 Python？」兜底引导：下载入口 + 装完该做什么。
+
+    向导和设置页共用 —— 探测失败时如果只丢一句"没找到 Python"，
+    用户下一步就是去搜索引擎碰运气（还可能装到 32 位 / Microsoft Store 版）。
+    """
+    from ..paths import PYTHON_DOWNLOADS
+
+    box = QWidget()
+    col = QVBoxLayout(box)
+    col.setContentsMargins(0, 0, 0, 0)
+    col.setSpacing(2)
+
+    row = QHBoxLayout()
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(6)
+    ask = QLabel("没装 Python？下载安装包：")
+    ask.setObjectName("mute")
+    row.addWidget(ask)
+    for i, (label, url) in enumerate(PYTHON_DOWNLOADS):
+        if i:
+            dot = QLabel("·")
+            dot.setObjectName("mute")
+            row.addWidget(dot)
+        row.addWidget(link_label(label, url))
+    row.addStretch(1)
+    col.addLayout(row)
+
+    note = QLabel(f"安装时勾选「Add python.exe to PATH」；包选【{_python_arch_label()}】；"
+                  "装完点「自动探测」。")
+    note.setObjectName("mute")
+    note.setWordWrap(True)
+    col.addWidget(note)
+
+    pip = QLabel("已有 Python 只缺依赖：pip install fastapi uvicorn httpx")
+    pip.setObjectName("mono")
+    pip.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    pip.setToolTip("点一下拖选，Ctrl+C 复制")
+    col.addWidget(pip)
+    return box
 
 
 def hspacer() -> QWidget:
