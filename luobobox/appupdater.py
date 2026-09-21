@@ -29,22 +29,23 @@ ANSI=OEM=936，所以用 Python 的 "mbcs" 写盘最稳 —— 这样即使安�
 
 from __future__ import annotations
 
-import json
-import os
 import shutil
 import subprocess
 import time
-import urllib.request
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import __version__
+from . import __version__, net
 from .paths import app_root, data_dir
 from .updater import _parse_version
 
 API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
 UA = {"User-Agent": f"LuoboBox/{__version__}", "Accept": "application/vnd.github+json"}
+
+# 最近一次下载实际走通的网络通道（失败/未下载过为 None）。
+# UI 拿它回显"经系统代理下载成功"这类信息，方便用户判断该不该改代理设置。
+LAST_ROUTE: "net.Route | None" = None
 
 # 资产命名（由 packaging/build.py 决定，纯 ASCII —— 中文在 Release 里会被吞掉）
 SETUP_PREFIX = "LuoboBox-Setup-"
@@ -67,6 +68,7 @@ class AppReleaseInfo:
     error: str = ""
     newer: bool = False
     local_version: str = ""
+    route: str = ""                                        # 实际走通的网络通道
     assets: dict[str, str] = field(default_factory=dict)   # 资产名 -> 下载地址
 
     def setup_asset(self) -> tuple[str, str] | None:
@@ -84,8 +86,43 @@ class AppReleaseInfo:
 
 # ---------------------------------------------------------------- 路径
 
+def _cfg_get(key: str, default=None):
+    """惰性读配置。
+
+    不能在模块顶层 import .config —— config 会间接走到 paths/appupdater，
+    容易形成环。这里每次现读，代价是几十微秒，换来确定性。
+    """
+    try:
+        from .config import Config
+
+        return Config.load().get(key, default)
+    except Exception:  # noqa: BLE001  配置读不出来不该让更新流程崩掉
+        return default
+
+
+def proxy_setting() -> str:
+    """用户在「设置」里手动指定的代理（空串 = 自动）。"""
+    return str(_cfg_get("net.proxy", "") or "").strip()
+
+
+def probe_setting() -> bool:
+    return bool(_cfg_get("net.probe", True))
+
+
 def updates_dir() -> Path:
-    """更新中转目录（下载的包、暂存解压、助手脚本与日志都在这）。"""
+    """更新中转目录（下载的包、暂存解压、助手脚本与日志都在这）。
+
+    默认跟随数据目录；配置 ``updater.work_dir`` 可改到别的盘。
+    下载包有 35~50MB，攒几次就能把系统盘挤爆，所以要能挪。
+    """
+    override = str(_cfg_get("updater.work_dir", "") or "").strip()
+    if override:
+        try:
+            d = Path(override)
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+        except OSError:
+            pass  # 配的路径不可用就静默回落，不要因此卡住更新
     d = data_dir() / "updates"
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -103,9 +140,10 @@ def check_app(repo: str) -> AppReleaseInfo:
     info = AppReleaseInfo(local_version=__version__)
     url = API_LATEST.format(repo=repo)
     try:
-        req = urllib.request.Request(url, headers=UA)
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
+        data, route = net.read_json(url, headers=UA, timeout=20,
+                                    cfg_proxy=proxy_setting(),
+                                    probe=probe_setting())
+        info.route = str(route)
     except Exception as exc:  # noqa: BLE001
         info.error = f"检查应用更新失败：{exc}"
         return info
@@ -152,14 +190,25 @@ def pick_asset(info: AppReleaseInfo, mode: str) -> tuple[str, str] | None:
 # ---------------------------------------------------------------- 下载 / 解包
 
 def download(url: str, dest_dir: Path, filename: str, timeout: int = 600) -> Path:
-    """流式下载到 .part 再原子改名 —— 中断不会留下半个"看起来能装"的包。"""
+    """流式下载到 .part 再原子改名 —— 中断不会留下半个"看起来能装"的包。
+
+    实际下载交给 :mod:`luobobox.net`：它会按
+    ``手动代理 → 系统代理 → 环境变量代理 → 直连`` 的顺序挑一条**探活过**的
+    通道。这一点很关键 —— 进程从外层 shell 继承来的 ``HTTPS_PROXY`` 可能指向
+    一个早就死掉的端口，直接 ``urlopen`` 会干等 21 秒然后抛
+    ``WinError 10060``，用户只会以为是 GitHub 挂了。
+
+    实际走通的通道记在 :data:`LAST_ROUTE`，UI 可以回显（"经系统代理下载成功"）。
+    """
+    global LAST_ROUTE
+    dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    target = dest_dir / filename
-    tmp = target.with_name(target.name + ".part")
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=timeout) as resp, open(tmp, "wb") as fh:
-        shutil.copyfileobj(resp, fh, length=1024 * 256)
-    os.replace(tmp, target)
+    target, route = net.download(
+        url, dest_dir / filename,
+        headers=UA, timeout=timeout,
+        cfg_proxy=proxy_setting(), probe=probe_setting(),
+    )
+    LAST_ROUTE = route
     return target
 
 
@@ -259,9 +308,17 @@ def helper_script(app_dir: Path, src: Path, mode: str, setup: Path | None,
         "",
         ":install",
         'if not exist "%SETUP%" goto relaunch',
-        '>>"%LOG%" echo [%DATE% %TIME%] 静默安装 %SETUP%',
+        '>>"%LOG%" echo [%DATE% %TIME%] 静默安装 %SETUP% 到 %APP%',
+        "rem /DIR 必须显式给：DefaultDirName 是 {autopf}\\LuoboBox，",
+        "rem 而 PrivilegesRequired=lowest 会把 {autopf} 解析成",
+        "rem %LOCALAPPDATA%\\Programs —— 也就是 C 盘。",
+        "rem 显式 /DIR 才能保证升级始终落在用户自己选的目录（如 D:\\LuoboBox），",
+        "rem 而不是又装一份到 C 盘、留下两处互不相干的安装。",
+        "rem /TASKS 故意不传：Inno 的 UsePreviousTasks 默认 yes，升级时会",
+        "rem 自动沿用上次勾选的开机自启 / 桌面快捷方式；而首次静默安装时",
+        "rem 强行打开机自启反而是错的（向导里那两个任务本来就是不勾的）。",
         '"%SETUP%" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS'
-        ' /RESTARTAPPLICATIONS >>"%LOG%" 2>&1',
+        ' /RESTARTAPPLICATIONS /DIR="%APP%" >>"%LOG%" 2>&1',
         "goto relaunch",
         "",
         ":relaunch",

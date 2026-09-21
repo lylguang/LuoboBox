@@ -103,6 +103,21 @@ def default_config() -> dict[str, Any]:
             "last_known_version": "",
             "app_last_check": "",
             "app_last_known_version": "",
+            # 更新中转目录（下载的包 / 暂存解压 / 助手脚本与日志）。
+            # 留空 = 跟随数据目录。填绝对路径可把下载挪到别的盘，
+            # 免得下载 50MB 的包把系统盘挤爆。
+            "work_dir": "",
+        },
+        "net": {
+            # 手动指定代理（如 http://127.0.0.1:20809）。留空 = 自动：
+            # 依次试「Windows 系统代理 → 环境变量代理 → 直连」，
+            # 每个候选先做 0.8 秒 TCP 探活，死的直接跳过。
+            # 为什么需要它：进程可能从某个 shell 继承到**已经死掉的**
+            # HTTP_PROXY，urllib 会傻等 21 秒再报 WinError 10060 ——
+            # 那个报错看着像「GitHub 连不上」，其实是「代理连不上」。
+            "proxy": "",
+            # 下载前是否先探活候选通道（关掉会慢很多，一般别动）
+            "probe": True,
         },
         "ui": {
             "log_tail_lines": 800,

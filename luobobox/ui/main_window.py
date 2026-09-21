@@ -39,12 +39,23 @@ from PySide6.QtWidgets import (
 )
 
 from . import theme
-from .. import __version__, appupdater, autostart, patcher, updater
+from .. import __version__, appupdater, autostart, net, patcher, updater
 from ..clientconfig import snippet_claude, snippet_codex
 from ..config import gen_api_key, port_free
 from ..context import AppContext, warn_scheduled_task
 from ..gateway import is_admin, remove_scheduled_task
-from ..paths import data_dir, find_python, icon_path, log_dir
+from ..paths import (
+    app_root,
+    backup_dir,
+    data_dir,
+    dir_size,
+    find_python,
+    human_size,
+    icon_path,
+    is_on_system_drive,
+    log_dir,
+    migrate_data_dir,
+)
 
 HEALTH_LABEL = {
     "ready": ("正常", theme.OK),
@@ -395,7 +406,7 @@ class MainWindow(QMainWindow):
         claude.add(self.claude_snippet)
         box.addWidget(claude)
 
-        hint = QLabel("提示：改完 Codex 配置后需要**完全退出并重新打开** Codex 桌面版才会生效；"
+        hint = QLabel("提示：改完 Codex 配置后需要「完全退出并重新打开」Codex 桌面版才会生效；"
                       "不要用桌面 App 里的模型选择器换模型（那是 OpenAI 的型号列表）。")
         hint.setObjectName("mute")
         hint.setWordWrap(True)
@@ -460,16 +471,53 @@ class MainWindow(QMainWindow):
         self.update_toast = Toast()
         box.addWidget(self.update_toast)
 
+        # ---- 下载通道 ---------------------------------------------------
+        # 放在最上面：用户在这里看到"更新出错"，修的地方也该在这里。
+        dl_card = Card(
+            "下载通道",
+            "检查更新、下载安装包都要连 GitHub。萝卜盒会依次尝试下列通道，"
+            "每条先做一次 0.8 秒探活 —— 连不上的直接跳过。\n"
+            "为什么要这样：进程可能从一个外层 shell 继承到一个「已经死掉的」代理，"
+            "这时直接请求会干等约 21 秒，最后报「WinError 10060 连接方没有正确答复」——"
+            "那个提示看着像 GitHub 挂了，其实是代理连不上。")
+        self.routes_out = QPlainTextEdit()
+        self.routes_out.setReadOnly(True)
+        self.routes_out.setMaximumHeight(150)
+        self.routes_out.setPlaceholderText(
+            "点「诊断下载通道」查看每条通道是否可达、以及实测结果…")
+        dl_card.add(self.routes_out)
+
+        proxy_row = QHBoxLayout()
+        self.in_proxy = QLineEdit(str(self.ctx.config.get("net.proxy", "") or ""))
+        self.in_proxy.setPlaceholderText("手动代理，留空 = 自动（如 http://127.0.0.1:20809）")
+        self.chk_probe = QCheckBox("下载前先探活")
+        self.chk_probe.setChecked(bool(self.ctx.config.get("net.probe", True)))
+        proxy_row.addWidget(self.in_proxy, 1)
+        proxy_row.addWidget(self.chk_probe)
+        dl_card.add_layout(proxy_row)
+
+        btn_row = QHBoxLayout()
+        self.btn_save_diag = _btn("保存并诊断", "primary")
+        self.btn_save_diag.clicked.connect(self._save_and_diagnose)
+        btn_row.addWidget(self.btn_save_diag)
+        btn_row.addStretch(1)
+        dl_card.add_layout(btn_row)
+        box.addWidget(dl_card)
+
         # ---- 萝卜盒自身（应用）更新 --------------------------------------
         app_card = Card(
             "萝卜盒更新",
-            f"让萝卜盒自己升级到最新版。来源：本项目的 GitHub Release。"
-            f"升级方式按安装形态自动选择（安装版走静默安装包，便携版走原地覆盖），"
-            f"完成后自动重启；配置 / 日志 / 备份都在 {appupdater.updates_dir().parent}，不受影响")
+            "让萝卜盒自己升级到最新版。来源：本项目的 GitHub Release。"
+            "升级方式按安装形态自动选择（安装版走静默安装包，便携版走原地覆盖），"
+            "完成后自动重启。\n"
+            "升级只覆盖下面这个「程序目录」，且安装包会显式带上 /DIR 指定到该目录 ——"
+            "不会另装一份到 C 盘。配置 / 日志 / 备份都在数据目录里，不受影响。")
+        self.kv_app_dir = KeyValue("程序目录", str(app_root()), mono=True)
+        self.kv_app_work = KeyValue("下载中转", str(appupdater.updates_dir()), mono=True)
         self.kv_app_local = KeyValue("当前版本", __version__, mono=True)
         self.kv_app_remote = KeyValue("最新版本", "未检查", mono=True)
-        app_card.add(self.kv_app_local)
-        app_card.add(self.kv_app_remote)
+        for kv in (self.kv_app_dir, self.kv_app_work, self.kv_app_local, self.kv_app_remote):
+            app_card.add(kv)
 
         row_app = QHBoxLayout()
         self.btn_check_app = _btn("检查应用更新", "primary")
@@ -578,12 +626,12 @@ class MainWindow(QMainWindow):
         box.addWidget(gw)
 
         # ---- 网络
-        net = Card("网络与公网入口",
-                   "公网走 Tailscale Funnel，不经过 Windows 防火墙；"
-                   "Funnel 只允许 443 / 8443 / 10000 三个端口")
+        net_card = Card("网络与公网入口",
+                        "公网走 Tailscale Funnel，不经过 Windows 防火墙；"
+                        "Funnel 只允许 443 / 8443 / 10000 三个端口")
         self.chk_funnel = QCheckBox("开启公网入口（Funnel）")
         self.chk_funnel.setChecked(bool(self.ctx.config.get("funnel.enabled")))
-        net.add(self.chk_funnel)
+        net_card.add(self.chk_funnel)
 
         f2 = QFormLayout()
         f2.setLabelAlignment(Qt.AlignRight)
@@ -594,14 +642,14 @@ class MainWindow(QMainWindow):
 
         self.in_ts = QLineEdit(str(self.ctx.config.get("funnel.tailscale_exe")))
         f2.addRow("tailscale.exe", self.in_ts)
-        net.add_layout(f2)
+        net_card.add_layout(f2)
 
         warn = QLabel("⚠ 关闭时只会关掉本端口，绝不会执行 funnel reset —— "
                       "那会把同机 443 上其他服务的公网入口一起清掉。")
         warn.setObjectName("mute")
         warn.setWordWrap(True)
-        net.add(warn)
-        box.addWidget(net)
+        net_card.add(warn)
+        box.addWidget(net_card)
 
         # ---- 启动与退出
         life = Card("启动与退出")
@@ -616,6 +664,44 @@ class MainWindow(QMainWindow):
         for c in (self.chk_autostart, self.chk_gw_autostart, self.chk_min_tray, self.chk_stop_exit):
             life.add(c)
         box.addWidget(life)
+
+        # ---- 数据与磁盘
+        disk = Card(
+            "数据与磁盘",
+            "配置、日志、备份、下载中转都放在「数据目录」里。默认在系统盘"
+            "（%LOCALAPPDATA%\\LuoboBox）—— 网关备份一份就可能几百 MB，"
+            "C 盘吃紧时可以把整个数据目录搬到别的盘。")
+        self.lbl_app_dir = QLabel(str(app_root()))
+        self.lbl_app_dir.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lbl_app_dir.setWordWrap(True)
+        self.lbl_data_dir = QLabel("")
+        self.lbl_data_dir.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lbl_data_dir.setWordWrap(True)
+        self.lbl_data_size = QLabel("正在统计…")
+        self.lbl_data_size.setObjectName("mute")
+        disk.add(QLabel("程序安装目录（升级只覆盖这里，不会另装到 C 盘）："))
+        disk.add(self.lbl_app_dir)
+        disk.add(QLabel("数据目录（配置 / 日志 / 备份 / 下载中转）："))
+        disk.add(self.lbl_data_dir)
+        disk.add(self.lbl_data_size)
+
+        self.lbl_disk_warn = QLabel("")
+        self.lbl_disk_warn.setWordWrap(True)
+        self.lbl_disk_warn.setStyleSheet(f"color: {theme.WARN};")
+        disk.add(self.lbl_disk_warn)
+
+        mrow = QHBoxLayout()
+        self.btn_migrate = _btn("迁移数据目录到其他盘…", "ghost")
+        self.btn_migrate.clicked.connect(self._migrate_data_dir)
+        self.btn_refresh_disk = _btn("刷新", "ghost")
+        self.btn_refresh_disk.clicked.connect(self._refresh_disk_info)
+        mrow.addWidget(self.btn_migrate)
+        mrow.addWidget(self.btn_refresh_disk)
+        mrow.addStretch(1)
+        disk.add_layout(mrow)
+        box.addWidget(disk)
+        # 体积要递归统计两万多个文件，别卡住建界面；推到事件循环里再跑。
+        QTimer.singleShot(0, self._refresh_disk_info)
 
         # ---- 迁移与诊断
         diag = Card("迁移与诊断")
@@ -1025,7 +1111,7 @@ class MainWindow(QMainWindow):
 
         self.ctx.run_task(
             lambda: appupdater.check_app(repo), done,
-            lambda m: self._on_toast(f"检查应用更新失败：{m.splitlines()[0]}", "error"),
+            lambda m: self._app_net_failed("检查应用更新失败", m),
             busy_text="正在检查萝卜盒更新…",
         )
 
@@ -1049,26 +1135,42 @@ class MainWindow(QMainWindow):
         if QMessageBox.question(
             self, "更新萝卜盒",
             f"将下载 {info.tag} 的{kind}：\n    {name}\n\n"
-            f"下载完成后萝卜盒会**自动关闭**，由后台助手完成替换并重新启动。\n\n"
-            f"· 安装形态：{mode}\n"
-            f"· 下载与日志目录：{dest}\n"
-            f"· 配置 / 日志 / 备份不受影响\n\n现在更新？",
+            "下载完成后萝卜盒会自动关闭，由后台助手完成替换并重新启动。\n\n"
+            f"· 程序目录（升级只覆盖这里）：{app_root()}\n"
+            f"· 下载中转目录：{dest}\n"
+            f"· 数据目录（配置 / 日志 / 备份）：{data_dir()}\n"
+            f"· 安装包会显式指定 /DIR={app_root()}，不会另装一份到 C 盘\n\n"
+            "现在更新？",
         ) != QMessageBox.Yes:
             return
 
         self.ctx.run_task(
             lambda: self._do_app_update_work(mode, name, url),
             self._after_app_update,
-            lambda m: self._on_toast(f"应用更新失败：{m.splitlines()[0]}", "error"),
+            lambda m: self._app_net_failed("应用更新失败", m),
             busy_text="正在下载萝卜盒更新…",
         )
 
+    def _app_net_failed(self, prefix: str, message: str) -> None:
+        """失败时把**完整**原因铺开。
+
+        net 层抛出来的是一份逐通道清单（"手动代理…：连不上（探活 0.8s 超时，已跳过）"…）。
+        只取第一行等于把最有用的信息丢掉，用户就又回到"只知道出错、不知道改哪"。
+        """
+        self._on_toast(f"{prefix}：{message.splitlines()[0]}", "error")
+        self.app_update_notes.setPlainText(message)
+
+    def _gateway_net_failed(self, prefix: str, message: str) -> None:
+        self._on_toast(f"{prefix}：{message.splitlines()[0]}", "error")
+        self.update_notes.setPlainText(message)
+
     def _do_app_update_work(self, mode: str, name: str, url: str) -> str:
         archive = appupdater.download(url, appupdater.updates_dir(), name)
+        route = appupdater.LAST_ROUTE
         plan = appupdater.apply_and_restart(mode, archive)
         if not plan.ok:
             return plan.message
-        return plan.message
+        return f"下载走的是{route}；{plan.message}" if route else plan.message
 
     def _after_app_update(self, message: str) -> None:
         self._on_toast(f"{message}；萝卜盒即将退出并自动重启…", "ok")
@@ -1115,7 +1217,7 @@ class MainWindow(QMainWindow):
 
         self.ctx.run_task(
             lambda: updater.check(gw, repo), done,
-            lambda m: self._on_toast(f"检查更新失败：{m.splitlines()[0]}", "error"),
+            lambda m: self._gateway_net_failed("检查更新失败", m),
             busy_text="正在检查更新…",
         )
 
@@ -1127,7 +1229,8 @@ class MainWindow(QMainWindow):
         if QMessageBox.question(
             self, "更新网关",
             f"将从上游下载 {info.tag} 覆盖网关代码。\n\n"
-            "· 会自动备份整个网关目录\n"
+            "· 会自动备份整个网关目录（已排除 node_modules / .venv / .git 等，"
+            f"只保留最近 {updater.BACKUP_KEEP} 份）\n"
             "· 保留 auth/、.env 与既有启动脚本\n"
             "· 升级后自动重打脱敏补丁\n\n继续？",
         ) != QMessageBox.Yes:
@@ -1137,21 +1240,25 @@ class MainWindow(QMainWindow):
         self.ctx.run_task(
             lambda: self._do_update_work(gw, info),
             lambda r: self._on_toast(r, "ok"),
-            lambda m: self._on_toast(f"更新失败：{m.splitlines()[0]}", "error"),
+            self._gateway_update_failed,
             busy_text="正在下载并应用更新…",
         )
 
-    def _do_update_work(self, gw: Path, info) -> str:
-        from ..paths import backup_dir
+    def _gateway_update_failed(self, message: str) -> None:
+        """同 _app_update_failed：完整原因进正文，别只留第一行。"""
+        self._on_toast(f"更新失败：{message.splitlines()[0]}", "error")
+        self.update_notes.setPlainText(message)
 
+    def _do_update_work(self, gw: Path, info) -> str:
         dl = backup_dir() / "_downloads"
         archive = updater.download(info.tarball or info.zipball, dl)
         res = updater.apply_release(gw, archive)
         updater.cleanup_downloads()
         if not res.ok:
             return res.message
+        extra = f"；已清理 {res.pruned} 份旧备份" if res.pruned else ""
         return (f"{res.message}；脱敏补丁：{res.patched}；"
-                f"网页版管理台：{res.webui}。请重启网关使改动生效。")
+                f"网页版管理台：{res.webui}{extra}。请重启网关使改动生效。")
 
     # ---------------------------------------------------------- 设置
 
@@ -1248,6 +1355,78 @@ class MainWindow(QMainWindow):
         self.ctx.config = Config.load()
         self._on_toast("已从磁盘重新载入配置（部分改动需重启萝卜盒生效）", "info")
 
+    def _refresh_disk_info(self) -> None:
+        """刷新数据目录位置与体积（体积统计放后台线程）。"""
+        d = data_dir()
+        self.lbl_data_dir.setText(str(d))
+        self.lbl_disk_warn.setText(
+            "⚠ 数据目录在系统盘上。网关备份一份可能几百 MB，"
+            "C 盘吃紧时建议迁到 D 盘 —— 备份和下载中转会一起搬走。"
+            if is_on_system_drive(d) else "")
+        self.lbl_data_size.setText("正在统计体积…")
+
+        def work() -> str:
+            return (f"当前占用 {human_size(dir_size(d))}"
+                    f"，其中备份 {human_size(dir_size(backup_dir()))}")
+
+        self.ctx.run_task(work, self.lbl_data_size.setText,
+                          lambda m: self.lbl_data_size.setText(f"统计失败：{m}"))
+
+    def _migrate_data_dir(self) -> None:
+        """把整个数据目录搬到别的盘，缓解系统盘压力。"""
+        src = data_dir()
+        start = (str(Path(src).drive) + "\\") if Path(src).drive else ""
+        target = QFileDialog.getExistingDirectory(
+            self, "选择新的数据目录所在位置（建议 D 盘）", start)
+        if not target:
+            return
+        chosen = Path(target)
+        dst = chosen if chosen.name.lower() == "luoboboxdata" else chosen / "LuoboBoxData"
+        if dst.resolve() == src.resolve():
+            self._on_toast("选中的就是当前数据目录，无需迁移", "warn")
+            return
+        if QMessageBox.question(
+            self, "迁移数据目录",
+            f"把整个数据目录搬到：\n    {dst}\n\n"
+            f"· 原位置：{src}\n"
+            "· 顺序是「先复制 → 再写指针 → 最后删旧」，中途失败不会丢数据\n"
+            "· 指针文件留在原位置，程序下次启动才知道新位置在哪\n"
+            "· 搬完需要重启萝卜盒才生效\n\n继续？",
+        ) != QMessageBox.Yes:
+            return
+
+        def done(res) -> None:
+            ok, msg = res
+            self._on_toast(msg if ok else f"迁移未完成：{msg}", "ok" if ok else "error")
+            self._refresh_disk_info()
+
+        self.ctx.run_task(lambda: migrate_data_dir(dst), done,
+                          lambda m: self._on_toast(f"迁移失败：{m}", "error"),
+                          busy_text="正在迁移数据目录…")
+
+    def _save_and_diagnose(self) -> None:
+        """把下载通道设置写进配置，然后逐条实测。
+
+        这里刻意就地保存（不等「保存设置」）—— 用户是在更新页撞上
+        「更新出错」的，修的地方就该在同一屏，多绕一步只会让人放弃。
+        """
+        cfg = self.ctx.config
+        cfg.set("net.proxy", self.in_proxy.text().strip())
+        cfg.set("net.probe", self.chk_probe.isChecked())
+        cfg.save()
+        self._on_toast("下载通道设置已保存", "ok")
+        self._diagnose_network()
+
+    def _diagnose_network(self) -> None:
+        proxy = str(self.ctx.config.get("net.proxy", "") or "")
+        self.routes_out.setPlainText("正在逐条探测下载通道…")
+        self.ctx.run_task(
+            lambda: net.diagnose(proxy),
+            self.routes_out.setPlainText,
+            lambda m: self.routes_out.setPlainText(f"网络诊断失败：{m}"),
+            busy_text="正在探测下载通道…",
+        )
+
     def _run_diag(self) -> None:
         self.diag_out.setPlainText("体检中…")
 
@@ -1255,7 +1434,11 @@ class MainWindow(QMainWindow):
             cfg = self.ctx.config
             lines = []
             lines.append(f"萝卜盒版本      {__version__}")
-            lines.append(f"数据目录        {data_dir()}")
+            lines.append(f"程序目录        {app_root()}")
+            lines.append(f"数据目录        {data_dir()}"
+                         f"  {'（系统盘）' if is_on_system_drive() else '（非系统盘）'}")
+            lines.append(f"数据占用        {human_size(dir_size(data_dir()))}"
+                         f"，其中备份 {human_size(dir_size(backup_dir()))}")
             lines.append(f"配置文件        {cfg.path}")
             lines.append(f"管理员权限      {'是' if is_admin() else '否（Funnel / 计划任务可能需要）'}")
             lines.append("")
@@ -1289,6 +1472,13 @@ class MainWindow(QMainWindow):
             lines.append(f"[公网] tailscale {'✓ 存在' if fst.available else '✗ 未找到'}")
             lines.append(f"[公网] 后端      {'运行中' if fst.running else '未运行'}")
             lines.append(f"[公网] Funnel    {fst.detail}")
+            lines.append("")
+
+            manual = str(cfg.get("net.proxy", "") or "")
+            lines.append(f"[网络] 手动代理  {manual or '（未设置，自动挑选）'}")
+            lines.append("[网络] 下载通道  （探活 0.8 秒，连不上就跳过）")
+            for row in net.describe_routes(manual):
+                lines.append(f"                 · {row}")
             lines.append("")
 
             from ..clientconfig import ClaudeConfigurator, CodexConfigurator

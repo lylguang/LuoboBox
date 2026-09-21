@@ -37,14 +37,181 @@ def icon_path() -> Path:
 
 # ---------------------------------------------------------------- 用户数据
 
-def data_dir() -> Path:
-    """可写数据目录：%LOCALAPPDATA%\\LuoboBox（可用 LUOBOBOX_DATA_DIR 覆盖，便于测试）。"""
-    override = os.environ.get("LUOBOBOX_DATA_DIR")
-    base = Path(override) if override else Path(
+DATA_DIR_POINTER = "datadir.txt"
+
+
+def default_data_dir() -> Path:
+    """出厂默认数据目录：%LOCALAPPDATA%\\LuoboBox（在系统盘 C: 上）。"""
+    return Path(
         os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local"
     ) / APP_NAME_EN
+
+
+def data_dir_override() -> Path | None:
+    """读「数据目录迁移指针」。
+
+    指针文件**永远留在出厂默认目录**里 —— 这是关键：无论数据被搬到哪个盘，
+    程序下次启动都能从固定位置找回它。指针内容是一行绝对路径。
+    """
+    ptr = default_data_dir() / DATA_DIR_POINTER
+    try:
+        if not ptr.is_file():
+            return None
+        raw = ptr.read_text(encoding="utf-8-sig", errors="replace").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    p = Path(raw)
+    return p if p.is_dir() else None
+
+
+def data_dir() -> Path:
+    """可写数据目录。
+
+    优先级：LUOBOBOX_DATA_DIR 环境变量（测试用）> 迁移指针 > 出厂默认。
+    """
+    override = os.environ.get("LUOBOBOX_DATA_DIR")
+    if override:
+        base = Path(override)
+    else:
+        base = data_dir_override() or default_data_dir()
     base.mkdir(parents=True, exist_ok=True)
     return base
+
+
+def is_on_system_drive(path: Path | str | None = None) -> bool:
+    """目标是否落在系统盘（C:）。给 UI 提示用。"""
+    target = Path(path or data_dir())
+    system = (os.environ.get("SystemDrive") or "C:").rstrip("\\/")
+    try:
+        return target.drive.upper().rstrip(":") == system.upper().rstrip(":")
+    except (AttributeError, IndexError):
+        return False
+
+
+def dir_size(path: Path | str) -> int:
+    """递归统计目录字节数（失败的文件跳过，不抛）。"""
+    total = 0
+    for q in Path(path).rglob("*"):
+        try:
+            if q.is_file():
+                total += q.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def human_size(num: float) -> str:
+    """1536 -> '1.5 KB'。给 UI 显示体积用。"""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(num) < 1024 or unit == "TB":
+            return f"{num:.0f} {unit}" if unit == "B" else f"{num:.1f} {unit}"
+        num /= 1024
+    return f"{num:.1f} TB"
+
+
+def data_dir_pointer_path() -> Path:
+    """迁移指针的固定位置（永远在出厂默认目录里）。"""
+    return default_data_dir() / DATA_DIR_POINTER
+
+
+def migrate_data_dir(target: Path | str, *, move: bool = True) -> tuple[bool, str]:
+    """把整个数据目录迁到 target。返回 (是否成功, 说明)。
+
+    顺序刻意是「**先复制 → 再写指针 → 最后删旧**」：
+
+    * 指针是唯一的真相来源，只有确认新位置内容齐了才敢写它；
+    * 写了指针之后旧目录才允许删。
+
+    这样任何一步失败都不会出现「两边都没有」的最坏情况 ——
+    最差也只是多占一份磁盘，用户重试一次即可。
+    """
+    src = data_dir()
+    dst = Path(target).expanduser()
+    if not str(dst).strip():
+        return False, "目标目录为空"
+    if dst == src:
+        return False, "目标就是当前数据目录，无需迁移"
+    try:
+        dst.relative_to(src)
+        return False, "目标目录不能位于当前数据目录内部"
+    except ValueError:
+        pass
+    if dst.is_file():
+        return False, f"目标位置已经有一个同名文件：{dst}"
+
+    # 空间检查：按当前数据的 1.1 倍估算
+    need = int(dir_size(src) * 1.1)
+    try:
+        free = shutil.disk_usage(dst.anchor or dst.drive or "C:\\").free
+    except OSError:
+        free = None
+    if free is not None and need > free:
+        return False, (f"目标盘空间不足：需要约 {need / 1048576:.0f} MB，"
+                       f"可用 {free / 1048576:.0f} MB")
+
+    try:
+        dst.mkdir(parents=True, exist_ok=True)
+        probe = dst / ".luobox-write-test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        return False, f"目标目录不可写：{exc}"
+
+    copied = 0
+    try:
+        for item in src.iterdir():
+            if item.name == DATA_DIR_POINTER:
+                continue
+            dest = dst / item.name
+            if item.is_dir():
+                shutil.copytree(item, dest, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, dest)
+            copied += 1
+    except OSError as exc:
+        return False, f"复制失败（旧数据仍在 {src}，未做任何删除）：{exc}"
+
+    # 写指针 —— 这一步之后程序才会去新位置
+    ptr = data_dir_pointer_path()
+    try:
+        ptr.parent.mkdir(parents=True, exist_ok=True)
+        ptr.write_text(str(dst.resolve()), encoding="utf-8")
+    except OSError as exc:
+        return False, f"写迁移指针失败（旧数据仍在 {src}）：{exc}"
+
+    removed = 0
+    if move:
+        for item in src.iterdir():
+            if item.name == DATA_DIR_POINTER:
+                continue
+            try:
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                else:
+                    item.unlink()
+                removed += 1
+            except OSError:
+                pass
+
+    msg = (f"数据目录已迁到 {dst}（复制 {copied} 项，"
+           f"约 {human_size(dir_size(dst))}"
+           + (f"；清理旧目录 {removed} 项" if move else "")
+           + "）。重启萝卜盒后生效。")
+    return True, msg
+
+
+def reset_data_dir_pointer() -> tuple[bool, str]:
+    """撤销迁移：删掉指针，让数据目录回到出厂默认位置（不搬文件）。"""
+    ptr = data_dir_pointer_path()
+    if not ptr.is_file():
+        return False, "当前没有迁移指针，数据目录本来就是出厂默认位置"
+    try:
+        ptr.unlink()
+    except OSError as exc:
+        return False, f"删除指针失败：{exc}"
+    return True, f"指针已删除，数据目录回到 {default_data_dir()}（文件没有搬回，需要手工处理）"
 
 
 def config_file() -> Path:
