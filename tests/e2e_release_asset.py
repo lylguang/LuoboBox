@@ -30,6 +30,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+# 🔴 必须在 import luobobox **之前**把数据目录改道到临时目录。
+#
+# 原因：`data_dir()` 会读真实的迁移指针，而读老位置指针时会**顺手自愈**
+# （把指针搬到「程序目录旁」）。源码模式下「程序目录旁」= 仓库根，
+# 于是本机安装版（app_root = D:\LuoboBox）正在用的那个指针会被搬走并删掉 ——
+# 它下次启动两个位置都找不到指针，就回落到 C 盘默认目录，看起来像
+# 「配置和备份全没了」。测试一律用临时目录，别碰真实指针。
+import tempfile  # noqa: E402
+
+_TMP = Path(tempfile.mkdtemp(prefix="luobobox-e2e-release-"))
+os.environ["LUOBOBOX_DATA_DIR"] = str(_TMP)
+os.environ["LUOBOBOX_POINTER_DIR"] = str(_TMP / "appdir")
+
 from luobobox import appupdater as A  # noqa: E402
 from luobobox.updater import _parse_version  # noqa: E402
 
