@@ -30,6 +30,30 @@ def _num(value: float) -> str:
     return f"{v:,.2f}"
 
 
+def _cached_font(kind: str, px_size: float, weight=None) -> QFont:
+    """按 (用途, 字号, 字重) 缓存 QFont。
+
+    QFont 的构造要走一次字体匹配，不算便宜；柱状图原来在**每根柱子**的循环里
+    调一次 `_small()`，30 根柱子就是 30 次字体匹配。
+    字号由 `theme.px()` 算进来，所以切换"大 / 特大"档位时 key 自然变化，
+    缓存不会把图钉在旧字号上。
+
+    ★ 共享 QFont 是安全的：`QPainter.setFont()` 是拷贝语义。
+    """
+    key = (kind, round(float(px_size), 2), weight)
+    f = _font_cache.get(key)
+    if f is None:
+        f = QFont()
+        f.setPointSizeF(float(px_size))
+        if weight is not None:
+            f.setWeight(weight)
+        _font_cache[key] = f
+    return f
+
+
+_font_cache: dict[tuple, QFont] = {}
+
+
 class BarChart(QWidget):
     """按天消耗柱状图。鼠标悬停在某根柱子上会给出当天数值。
 
@@ -68,10 +92,10 @@ class BarChart(QWidget):
 
         p.setPen(QPen(QColor(theme.BORDER), 1))
         p.drawLine(int(left), int(base_y), int(left + plot_w), int(base_y))
+        p.setFont(self._small())
 
         if not self._data:
             p.setPen(QColor(theme.TEXT_MUTE))
-            p.setFont(self._small())
             p.drawText(self.rect(), Qt.AlignCenter, "暂无数据")
             return
 
@@ -83,7 +107,9 @@ class BarChart(QWidget):
         accent = QColor(theme.ACCENT)
         dim = QColor(theme.ACCENT)
         dim.setAlpha(95)
-        p.setPen(Qt.NoPen)
+        # 文字画笔只建一次（原来每根柱子都新建一个 QColor / 隐式 QPen）
+        axis_pen = QPen(QColor(theme.TEXT_MUTE))
+        peak_pen = QPen(QColor(theme.TEXT_DIM))
 
         for i, (day, value) in enumerate(self._data):
             cx = left + slot * (i + 0.5)
@@ -92,29 +118,28 @@ class BarChart(QWidget):
                 bh = 2.0          # 全为 0 时留一条底线，别让人以为图没画出来
             else:
                 bh = max(2.0, plot_h * (value / peak))
+            # 每根柱子都显式清笔：上一轮可能刚用过文字画笔，
+            # 不清的话这根柱子会被描上一圈边框。
+            p.setPen(Qt.NoPen)
             p.setBrush(accent if (peak > 0 and value >= peak) else dim)
             p.drawRoundedRect(
                 QRectF(cx - bar_w / 2, base_y - bh, bar_w, bh), 3, 3)
 
             # 日期抽稀：30 根柱子全标会糊成一片
             if n <= 8 or i == 0 or i == n - 1 or i % 5 == 0:
-                p.setPen(QColor(theme.TEXT_MUTE))
-                p.setFont(self._small())
+                p.setPen(axis_pen)
                 p.drawText(QRectF(cx - slot / 2, base_y + 2, slot, 16),
                            Qt.AlignHCenter | Qt.AlignTop, str(day)[5:])
 
         if peak > 0:
-            p.setPen(QColor(theme.TEXT_DIM))
-            p.setFont(self._small())
+            p.setPen(peak_pen)
             p.drawText(QRectF(left, 0, plot_w, self.PAD_TOP),
                        Qt.AlignLeft | Qt.AlignVCenter,
                        f"峰值 {_num(peak)}{self._unit}")
 
     @staticmethod
     def _small() -> QFont:
-        f = QFont()
-        f.setPointSizeF(max(6.5, theme.px(10) * 0.68))
-        return f
+        return _cached_font("small", max(6.5, theme.px(10) * 0.68))
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         if not self._data:
@@ -171,10 +196,8 @@ class Donut(QWidget):
                 p.drawArc(box, start, span)
                 start += span
 
-        f = QFont()
-        f.setPointSizeF(max(8.0, theme.px(15) * 0.64))
-        f.setWeight(QFont.DemiBold)
-        p.setFont(f)
+        p.setFont(_cached_font("donut-main", max(8.0, theme.px(15) * 0.64),
+                               QFont.DemiBold))
         p.setPen(QColor(theme.TEXT))
         inner = QRectF(6, 6, self._size - 12, self._size - 12)
         if self._sub:
@@ -182,9 +205,7 @@ class Donut(QWidget):
         p.drawText(inner, Qt.AlignCenter, self._title)
 
         if self._sub:
-            f2 = QFont()
-            f2.setPointSizeF(max(6.5, theme.px(10) * 0.62))
-            p.setFont(f2)
+            p.setFont(_cached_font("donut-sub", max(6.5, theme.px(10) * 0.62)))
             p.setPen(QColor(theme.TEXT_MUTE))
             p.drawText(QRectF(6, self._size * 0.60, self._size - 12, self._size * 0.28),
                        Qt.AlignHCenter | Qt.AlignTop, self._sub)
@@ -208,9 +229,7 @@ class Legend(QWidget):
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        f = QFont()
-        f.setPointSizeF(max(7.0, theme.px(11) * 0.68))
-        p.setFont(f)
+        p.setFont(_cached_font("legend", max(7.0, theme.px(11) * 0.68)))
         y = 4
         for label, text, color in self._items:
             p.setPen(Qt.NoPen)

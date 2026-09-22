@@ -12,6 +12,7 @@ packaging/version_info.txt
 # 测试运行残留
 # ---------------------------------------------------------------------------
 tests/_shots/
+tests/_shots*/
 tests/_selftest/
 tests/_exerun/
 tests/_envsetup/

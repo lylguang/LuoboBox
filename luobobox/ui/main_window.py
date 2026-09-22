@@ -23,7 +23,6 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -49,6 +48,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import motion, theme
+from .widgets import IOSSwitch
 from .. import __version__, appupdater, autostart, net, patcher, updater
 from ..clientconfig import snippet_claude, snippet_codex
 from ..config import gen_api_key, port_free
@@ -152,6 +152,29 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(str(icon_path())))
         self._shortcuts: list[QShortcut] = []
         self._last_snap = None
+        # ---- 刷新缓存 ----
+        # 这些量要么"算一次就够"（本机地址、补丁体检），要么"只在值真的变了
+        # 才值得动控件"（状态色、按钮主次）。没有它们，`_refresh_state()` 每跑
+        # 一轮就要多付一次阻塞 socket + 一次目录遍历 + 六次样式表重解析，
+        # 而它被 state_changed（每个任务起止）和健康轮询反复触发。
+        self._lan_ip_cache: str | None = None
+        self._patch_cache: tuple[float, object] | None = None
+        self._patch_ttl_sec = 30.0
+        self._state_color = ""
+        self._hero_color = ""
+        self._hero_btn_active: bool | None = None
+        self._codex_snippet_cache = ""
+        self._claude_snippet_cache = ""
+        # 日志页增量渲染的状态（见 _refresh_log 的说明）：
+        #   _log_key   上次渲染所用的过滤条件，变了才整屏重建
+        #   _log_pos   已消费到的字节位置（对齐到行首，不含正在写的半行）
+        #   _log_total / _log_hits  状态行里的「命中 X/N 行」计数
+        self._log_key: tuple | None = None
+        self._log_pos = 0
+        self._log_total = 0
+        self._log_hits = 0
+        # 凭证表的最近一次内容签名，相同就跳过重建（见 _fill_credentials）
+        self._cred_sig: tuple | None = None
         self.setMinimumSize(780, 560)
         self._restore_geometry()
 
@@ -336,9 +359,15 @@ class MainWindow(QMainWindow):
         row.setSpacing(6)
 
         self._nav_host = QWidget()
+        # iOS 分段控件（UISegmentedControl）：轨道是一整块填充灰，选中项抬成
+        # 一张浮起来的片。QSS 里 QWidget#segmented 给了背景，但普通 QWidget
+        # 默认不画 QSS 背景 —— 必须开 WA_StyledBackground，否则轨道是透明的。
+        self._nav_host.setObjectName("segmented")
+        self._nav_host.setAttribute(Qt.WA_StyledBackground, True)
         self._nav_host_row = QHBoxLayout(self._nav_host)
-        self._nav_host_row.setContentsMargins(0, 0, 0, 0)
-        self._nav_host_row.setSpacing(6)
+        # 3px 内缩 + 3px 间隙 = 圆角片在轨道里的呼吸感
+        self._nav_host_row.setContentsMargins(3, 3, 3, 3)
+        self._nav_host_row.setSpacing(3)
         row.addWidget(self._nav_host)
         row.addStretch(1)
 
@@ -759,11 +788,11 @@ class MainWindow(QMainWindow):
         box.setSpacing(8)
 
         bar = QHBoxLayout()
-        self.log_autoscroll = QCheckBox("自动滚动")
+        self.log_autoscroll = IOSSwitch("自动滚动")
         self.log_autoscroll.setChecked(True)
         bar.addWidget(self.log_autoscroll)
 
-        self.chk_log_regex = QCheckBox("正则")
+        self.chk_log_regex = IOSSwitch("正则")
         self.chk_log_regex.setToolTip(
             "勾上后过滤串按正则解释，例如 ERROR|WARN。\n写错了会自动退回普通的包含匹配。")
         bar.addWidget(self.chk_log_regex)
@@ -830,6 +859,7 @@ class MainWindow(QMainWindow):
             "那个提示看着像 GitHub 挂了，其实是代理连不上。")
         self.routes_out = QPlainTextEdit()
         self.routes_out.setReadOnly(True)
+        self.routes_out.setMaximumBlockCount(2000)
         self.routes_out.setMaximumHeight(150)
         self.routes_out.setPlaceholderText(
             "点「诊断下载通道」查看每条通道是否可达、以及实测结果…")
@@ -838,7 +868,7 @@ class MainWindow(QMainWindow):
         proxy_row = QHBoxLayout()
         self.in_proxy = QLineEdit(str(self.ctx.config.get("net.proxy", "") or ""))
         self.in_proxy.setPlaceholderText("手动代理，留空 = 自动（如 http://127.0.0.1:20809）")
-        self.chk_probe = QCheckBox("下载前先探活")
+        self.chk_probe = IOSSwitch("下载前先探活")
         self.chk_probe.setChecked(bool(self.ctx.config.get("net.probe", True)))
         proxy_row.addWidget(self.in_proxy, 1)
         proxy_row.addWidget(self.chk_probe)
@@ -981,7 +1011,7 @@ class MainWindow(QMainWindow):
         net_card = Card("网络与公网入口",
                         "公网走 Tailscale Funnel，不经过 Windows 防火墙；"
                         "Funnel 只允许 443 / 8443 / 10000 三个端口")
-        self.chk_funnel = QCheckBox("开启公网入口（Funnel）")
+        self.chk_funnel = IOSSwitch("开启公网入口（Funnel）")
         self.chk_funnel.setChecked(bool(self.ctx.config.get("funnel.enabled")))
         net_card.add(self.chk_funnel)
 
@@ -1035,13 +1065,13 @@ class MainWindow(QMainWindow):
 
         # ---- 启动与退出
         life = Card("启动与退出")
-        self.chk_autostart = QCheckBox("开机自启（登录时启动萝卜盒）")
+        self.chk_autostart = IOSSwitch("开机自启（登录时启动萝卜盒）")
         self.chk_autostart.setChecked(autostart.is_autostart_on())
-        self.chk_gw_autostart = QCheckBox("启动萝卜盒时自动拉起网关")
+        self.chk_gw_autostart = IOSSwitch("启动萝卜盒时自动拉起网关")
         self.chk_gw_autostart.setChecked(bool(self.ctx.config.get("gateway.auto_start")))
-        self.chk_min_tray = QCheckBox("关闭窗口时最小化到托盘（不退出）")
+        self.chk_min_tray = IOSSwitch("关闭窗口时最小化到托盘（不退出）")
         self.chk_min_tray.setChecked(bool(self.ctx.config.get("app.minimize_to_tray")))
-        self.chk_stop_exit = QCheckBox("退出萝卜盒时同时停止网关")
+        self.chk_stop_exit = IOSSwitch("退出萝卜盒时同时停止网关")
         self.chk_stop_exit.setChecked(bool(self.ctx.config.get("gateway.stop_on_exit")))
         for c in (self.chk_autostart, self.chk_gw_autostart, self.chk_min_tray, self.chk_stop_exit):
             life.add(c)
@@ -1104,7 +1134,7 @@ class MainWindow(QMainWindow):
             "已经有值、且验证通过的项不会被覆盖。\n"
             "本机没有 Python 也不用管 —— 会自动下载一份内置的（免安装）；"
             "找不到网关源码会自动从上游拉一份。")
-        self.chk_env_venv = QCheckBox("缺依赖时新建独立虚拟环境（推荐：不污染系统 Python）")
+        self.chk_env_venv = IOSSwitch("缺依赖时新建独立虚拟环境（推荐：不污染系统 Python）")
         self.chk_env_venv.setChecked(True)
         self.chk_env_venv.setToolTip(
             "建在数据目录下的 pyenv\\，跟着数据一起搬、一起删。\n"
@@ -1123,6 +1153,9 @@ class MainWindow(QMainWindow):
 
         self.env_out = QPlainTextEdit()
         self.env_out.setReadOnly(True)
+        # ★ 上界：一键配置环境会把 pip / 下载器的输出整段回填，没有上限就是
+        #   越跑越长的文档（占内存、拖动滚动条也会越来越钝）。
+        self.env_out.setMaximumBlockCount(2000)
         self.env_out.setMaximumHeight(190)
         self.env_out.setPlaceholderText("点「一键配置环境」后在这里逐行显示过程…")
         env_card.add(self.env_out)
@@ -1132,17 +1165,17 @@ class MainWindow(QMainWindow):
 
         # ---- 迁移与诊断
         diag = Card("迁移与诊断")
-        from ..gateway import scheduled_task_exists
 
-        if scheduled_task_exists():
-            msg = QLabel("检测到旧部署的计划任务 codebuddy2api 仍存在，会和萝卜盒抢同一端口。")
-            msg.setObjectName("warnText")
-            msg.setWordWrap(True)
-            diag.add(msg)
-            self.btn_del_task = _btn("移除旧计划任务", "danger")
-            diag.add(self.btn_del_task)
-        else:
-            diag.add(QLabel("未检测到遗留的计划任务，环境干净。"))
+        # ★ 计划任务检测要起一个 `schtasks.exe` 子进程（冷启动几百毫秒到一两秒），
+        #   不能让它同步跑在构建设置页的路径上 —— 那是首帧"卡一下"的来源之一。
+        #   先摆一个占位块，等窗口显示之后再填（见 _fill_task_badge）。
+        self.task_badge_box = QVBoxLayout()
+        self.task_badge_box.setSpacing(8)
+        diag.add_layout(self.task_badge_box)
+        self.btn_del_task = None
+        self._task_placeholder = QLabel("正在检查计划任务…")
+        self._task_placeholder.setObjectName("mute")
+        self.task_badge_box.addWidget(self._task_placeholder)
 
         row2 = QHBoxLayout()
         self.btn_diag = _btn("环境体检", "ghost")
@@ -1156,6 +1189,7 @@ class MainWindow(QMainWindow):
 
         self.diag_out = QPlainTextEdit()
         self.diag_out.setReadOnly(True)
+        self.diag_out.setMaximumBlockCount(2000)
         self.diag_out.setMaximumHeight(140)
         diag.add(self.diag_out)
         box.addWidget(diag)
@@ -1188,7 +1222,7 @@ class MainWindow(QMainWindow):
         self.btn_restart.clicked.connect(ctx.restart_gateway)
         self.btn_dashboard.clicked.connect(self._open_dashboard)
 
-        self.btn_repatch.clicked.connect(ctx.repatch)
+        self.btn_repatch.clicked.connect(self._repatch)
         self.btn_checkin.clicked.connect(self._checkin)
 
         self.btn_add_cred.clicked.connect(self._open_credentials_page)
@@ -1247,7 +1281,11 @@ class MainWindow(QMainWindow):
         color = theme.status_color(state)
         self.dot.set_color(color)
         self.state_label.setText(ctx.gateway.state_label)
-        self.state_label.setStyleSheet(f"color: {color};")
+        # ★ 只在颜色真的变了才动样式表。setStyleSheet 会触发自身的样式重解析
+        #   与 re-polish，而这里每轮状态刷新都会被调用。
+        if color != self._state_color:
+            self._state_color = color
+            self.state_label.setStyleSheet(f"color: {color};")
 
         base = ctx.config.base_url()
         lan = f"http://{self._lan_ip()}:{ctx.config.get('gateway.port')}"
@@ -1292,7 +1330,9 @@ class MainWindow(QMainWindow):
         self.hero_ring.set_breathing(state == "running")
 
         self.hero_title.setText(label)
-        self.hero_title.setStyleSheet(f"color: {color};")
+        if color != self._hero_color:
+            self._hero_color = color
+            self.hero_title.setStyleSheet(f"color: {color};")
         self.hero_sub.setText(
             f"{base}　·　{'已就绪，可直接接入' if reachable else '未就绪'}")
 
@@ -1317,14 +1357,32 @@ class MainWindow(QMainWindow):
         # 留着它可点只会让用户误以为状态没刷新。
         active = state in ("running", "external", "starting")
         self.hero_btn_start.setText("停止网关" if active else "启动网关")
-        self.hero_btn_start.setObjectName("" if active else "primary")
-        # objectName 变了必须重套样式表，否则 #primary 的强调色配不上
-        self.hero_btn_start.style().unpolish(self.hero_btn_start)
-        self.hero_btn_start.style().polish(self.hero_btn_start)
+        if active != self._hero_btn_active:
+            # objectName 变了必须重套样式表，否则 #primary 的强调色配不上；
+            # 但没必要每轮都做 —— unpolish+polish 是一次完整的样式重算。
+            self._hero_btn_active = active
+            self.hero_btn_start.setObjectName("" if active else "primary")
+            self.hero_btn_start.style().unpolish(self.hero_btn_start)
+            self.hero_btn_start.style().polish(self.hero_btn_start)
         self.hero_btn_start.setEnabled(not self.ctx.runner.busy())
 
     def _refresh_patch_badge(self) -> None:
-        rep = self.ctx.patch_status()
+        """脱敏补丁体检角标。
+
+        ★ 带 TTL 缓存。`ctx.patch_status()` 最终会 `patcher.inspect()` —— 遍历整个
+          网关目录找品牌词。而本函数挂在 `_refresh_state()` 的尾巴上，等于每轮
+          状态刷新都做一次目录遍历。补丁状态只会在「重装网关 / 换目录 / 手动体检」
+          时变化，所以缓存 30 秒就够，这几个动作后调 `invalidate_patch_cache()`
+          立即失效。
+        """
+        now = time.monotonic()
+        cached = self._patch_cache
+        if cached is not None and now - cached[0] < self._patch_ttl_sec:
+            rep = cached[1]
+        else:
+            rep = self.ctx.patch_status()
+            self._patch_cache = (now, rep)
+
         if not rep.target_ok:
             self.kv_patch.set_value("无法体检")
             self.kv_patch.set_color(theme.WARN)
@@ -1335,6 +1393,18 @@ class MainWindow(QMainWindow):
             self.kv_patch.set_value(f"完好（{len(rep.present)} 个品牌词在位）")
             self.kv_patch.set_color(theme.OK)
 
+    def _repatch(self) -> None:
+        """手动体检脱敏补丁。
+
+        ★ 与补丁体检的 30 秒缓存配合：`repatch` 是后台任务，完成后
+          `state_changed` 会再刷一次角标 —— 那时**必须**让缓存失效，
+          否则角标还会显示"修好之前"的旧结论。这里先失效一次，
+          并在任务大概率完成后（延后排一次）再失效一次。
+        """
+        self.invalidate_patch_cache()
+        self.ctx.repatch()
+        QTimer.singleShot(2500, self.invalidate_patch_cache)
+
     def _on_health(self, snap) -> None:
         self._last_snap = snap
         self._refresh_state()
@@ -1343,6 +1413,26 @@ class MainWindow(QMainWindow):
 
     def _fill_credentials(self, snap) -> None:
         rows = getattr(snap, "credentials", None) or []
+
+        # ★ 内容没变就整块跳过。健康轮询每 15 秒来一次，而重建 N 行 × 4 列的
+        #   QTableWidgetItem 是实打实的开销；凭证池往往几十分钟都不变。
+        def _sig_of(item) -> tuple:
+            try:
+                return (str(item.get("name") or item.get("id") or "?"),
+                        str(item.get("health") or "unknown"),
+                        _fmt_credits(item.get("credits")),
+                        str(item.get("last_error_code") or ""),
+                        item.get("cooldown_remaining", 0),
+                        item.get("enabled") is False)
+            except Exception:  # noqa: BLE001
+                return ("?", "unparsable", "", "", 0, False)
+
+        sig = (bool(rows), bool(getattr(snap, "ok", False)),
+               tuple(_sig_of(r) for r in rows))
+        if sig == self._cred_sig:
+            return
+        self._cred_sig = sig
+
         if not rows:
             # 空态而不是"一行灰字占位"：灰字看起来像加载坏了，
             # 空态会说明原因并给出下一步按钮。
@@ -1356,36 +1446,41 @@ class MainWindow(QMainWindow):
             return
 
         self.cred_stack.setCurrentIndex(0)
-        self.cred_table.setRowCount(len(rows))
-        for r, item in enumerate(rows):
-            # 逐行兜底：某一行字段形态异常时只标记这一行，
-            # 不能让整个循环中断（早期就是被一个 dict 拖垮了整张表）。
-            try:
-                name = str(item.get("name") or item.get("id") or "?")
-                health = str(item.get("health") or "unknown")
-                label, color = health_label(health)
-
-                self.cred_table.setItem(r, 0, QTableWidgetItem(name))
-                h = QTableWidgetItem(label)
-                h.setForeground(QColor(color))
-                self.cred_table.setItem(r, 1, h)
-                self.cred_table.setItem(
-                    r, 2, QTableWidgetItem(_fmt_credits(item.get("credits"))))
-                extra = ""
-                if health == "circuit_open":
-                    extra = f"冷却 {item.get('cooldown_remaining', 0)}s"
-                elif item.get("last_error_code"):
-                    extra = str(item["last_error_code"])
-                elif item.get("enabled") is False:
-                    extra = "已从调度中排除"
-                self.cred_table.setItem(r, 3, QTableWidgetItem(extra))
-            except Exception:  # noqa: BLE001
+        # ★ 批量填充期间关掉重绘，否则每 setItem 都可能触发一次可见区重排
+        self.cred_table.setUpdatesEnabled(False)
+        try:
+            self.cred_table.setRowCount(len(rows))
+            for r, item in enumerate(rows):
+                # 逐行兜底：某一行字段形态异常时只标记这一行，
+                # 不能让整个循环中断（早期就是被一个 dict 拖垮了整张表）。
                 try:
-                    self.cred_table.setItem(r, 0, QTableWidgetItem(
-                        str(item.get("name") or item.get("id") or "?")))
-                    self.cred_table.setItem(r, 3, QTableWidgetItem("该行数据无法解析"))
+                    name = str(item.get("name") or item.get("id") or "?")
+                    health = str(item.get("health") or "unknown")
+                    label, color = health_label(health)
+
+                    self.cred_table.setItem(r, 0, QTableWidgetItem(name))
+                    h = QTableWidgetItem(label)
+                    h.setForeground(QColor(color))
+                    self.cred_table.setItem(r, 1, h)
+                    self.cred_table.setItem(
+                        r, 2, QTableWidgetItem(_fmt_credits(item.get("credits"))))
+                    extra = ""
+                    if health == "circuit_open":
+                        extra = f"冷却 {item.get('cooldown_remaining', 0)}s"
+                    elif item.get("last_error_code"):
+                        extra = str(item["last_error_code"])
+                    elif item.get("enabled") is False:
+                        extra = "已从调度中排除"
+                    self.cred_table.setItem(r, 3, QTableWidgetItem(extra))
                 except Exception:  # noqa: BLE001
-                    pass
+                    try:
+                        self.cred_table.setItem(r, 0, QTableWidgetItem(
+                            str(item.get("name") or item.get("id") or "?")))
+                        self.cred_table.setItem(r, 3, QTableWidgetItem("该行数据无法解析"))
+                    except Exception:  # noqa: BLE001
+                        pass
+        finally:
+            self.cred_table.setUpdatesEnabled(True)
 
     def _fill_credits(self, snap) -> None:
         credits = snap.credits or {}
@@ -1443,40 +1538,127 @@ class MainWindow(QMainWindow):
             return None
 
     def _refresh_log(self) -> None:
+        """日志页渲染（**增量**）。
+
+        ★ 为什么不能每轮 `setPlainText()`：它会重建整个 QTextDocument，而
+          `LogHighlighter` 会对**每一个** block 重跑 4 条正则 —— 800 行就是每轮
+          3200 次正则匹配。日志页开着时这就是持续烧 CPU 的元凶。
+          现在只在「过滤条件变了 / 日志被清空或轮转 / 攒了太多」时整屏重建，
+          其余情况只把**新增的完整行**追加到末尾，高亮器只处理新块。
+        """
         if not self.isVisible() or self.tab_key() != "logs":
             return
-        raw = self.ctx.gateway.tail_log(
-            int(self.ctx.config.get("ui.log_tail_lines", 800)))
-        lines = raw.splitlines()
 
         needle = self.log_filter.text().strip()
         rx = self._log_pattern()
-        if rx is not None:
-            shown = [ln for ln in lines if rx.search(ln)]
-        elif needle:
-            low = needle.lower()
-            shown = [ln for ln in lines if low in ln.lower()]
-        else:
-            shown = lines
-        text = "\n".join(shown)
+        key = (needle, rx.pattern if rx is not None else "")
+        tail_lines = int(self.ctx.config.get("ui.log_tail_lines", 800))
+
+        path = log_dir() / "gateway.log"
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
 
         bar = self.log_view.verticalScrollBar()
         at_bottom = bar.value() >= bar.maximum() - 4
-        if text != self.log_view.toPlainText():
-            self.log_view.setPlainText(text)
+        pending = max(0, size - self._log_pos)
+        rebuild = (
+            key != self._log_key
+            or size < self._log_pos              # 被清空 / 轮转
+            or pending > 256 * 1024              # 切走期间攒太多，重建更划算
+            or self._log_total > 5 * tail_lines  # 计数别跑到视图容量之外
+        )
+
+        if rebuild:
+            raw = self.ctx.gateway.tail_log(tail_lines)
+            lines = raw.splitlines()
+            shown = self._filter_log_lines(lines, needle, rx)
+            self._log_key = key
+            self._log_total = len(lines)
+            self._log_hits = len(shown)
+            self._log_pos = self._complete_line_offset(path, size)
+            self.log_view.setPlainText("\n".join(shown))
             if self.log_autoscroll.isChecked() and at_bottom:
                 self.log_view.moveCursor(QTextCursor.End)
+        elif pending:
+            fresh, new_pos = self._read_log_since(path, self._log_pos)
+            if fresh:
+                self._log_pos = new_pos
+                shown = self._filter_log_lines(fresh, needle, rx)
+                self._log_total += len(fresh)
+                self._log_hits += len(shown)
+                self._append_log_lines(shown, at_bottom)
 
-        path = log_dir() / "gateway.log"
-        size = path.stat().st_size if path.is_file() else 0
         tally = ""
         if needle:
-            tally = f"　命中 {len(shown)}/{len(lines)} 行"
+            tally = f"　命中 {self._log_hits}/{self._log_total} 行"
             if self.chk_log_regex.isChecked():
                 tally += "（正则）" if rx is not None else "　⚠ 正则无效，已按普通文本匹配"
         self.log_meta.setText(
-            f"gateway.log　{size / 1024:.1f} KB　共 {len(lines)} 行{tally}"
+            f"gateway.log　{size / 1024:.1f} KB　共 {self._log_total} 行{tally}"
             f"　{self._log_stamp()}")
+
+    @staticmethod
+    def _filter_log_lines(lines: list[str], needle: str, rx) -> list[str]:
+        """过滤条件只有三种形态：正则 / 普通包含 / 不过滤。"""
+        if rx is not None:
+            return [ln for ln in lines if rx.search(ln)]
+        if needle:
+            low = needle.lower()
+            return [ln for ln in lines if low in ln.lower()]
+        return list(lines)
+
+    @staticmethod
+    def _read_log_since(path: Path, start: int) -> tuple[list[str], int]:
+        """从 `start` 字节读到底，只返回**已完整成行**的部分与新的读位置。
+
+        ★ 只推进到最后一个换行符：正在写入的那半行不算读完 —— 否则下一次会从
+          半行中间接上，视图里就会出现"断头行"。半行会在它被写完的下一轮出现。
+        """
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(start)
+                chunk = fh.read()
+        except OSError:
+            return [], start
+        cut = chunk.rfind(b"\n")
+        if cut < 0:
+            return [], start
+        return chunk[:cut].decode("utf-8", "replace").splitlines(), start + cut + 1
+
+    @staticmethod
+    def _complete_line_offset(path: Path, size: int) -> int:
+        """文件末尾最后一个完整行之后的偏移 —— 把读位置对齐到行首。
+
+        整屏重建走的是 `tail_log()`，而它只保证"最后 N 行"，
+        不保证末尾半行的边界；直接用 `size` 当读位置会丢掉正在写的那半行。
+        """
+        if size <= 0:
+            return 0
+        try:
+            with open(path, "rb") as fh:
+                block = min(size, 64 * 1024)
+                fh.seek(size - block)
+                tail = fh.read()
+        except OSError:
+            return 0
+        cut = tail.rfind(b"\n")
+        return 0 if cut < 0 else size - block + cut + 1
+
+    def _append_log_lines(self, lines: list[str], at_bottom: bool) -> None:
+        """把新行追加到视图末尾（不动已有内容，也不重建文档）。"""
+        if not lines:
+            return
+        text = "\n".join(lines)
+        if not self.log_view.document().isEmpty():
+            text = "\n" + text
+        cur = self.log_view.textCursor()
+        cur.movePosition(QTextCursor.End)
+        cur.insertText(text)
+        self.log_view.setTextCursor(cur)
+        if self.log_autoscroll.isChecked() and at_bottom:
+            self.log_view.moveCursor(QTextCursor.End)
 
     def _export_log(self) -> None:
         """导出当前显示内容（含过滤结果）。文件名带时间戳，两次导出不会互相覆盖。"""
@@ -1713,16 +1895,38 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def _lan_ip(self) -> str:
+        """本机在局域网里的地址。
+
+        ★ 结果缓存。这个探测以前**每次 `_refresh_state()` 都跑一遍**，而
+          `_refresh_state()` 会被 `state_changed`（每个任务起止）与健康轮询
+          反复触发。探测本身是 UDP connect（不发包，通常瞬时），但网卡未就绪
+          或路由表异常时 `connect()` 会阻塞到超时 —— 那就直接卡住 UI 线程。
+          地址在一次运行内基本不变，算一次记下来即可；换网卡时由
+          `invalidate_network_cache()` 主动失效。
+        """
+        if self._lan_ip_cache is not None:
+            return self._lan_ip_cache
         import socket
 
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
+            try:
+                s.connect(("8.8.8.8", 80))
+                ip = s.getsockname()[0]
+            finally:
+                s.close()
         except Exception:  # noqa: BLE001
-            return "127.0.0.1"
+            ip = "127.0.0.1"
+        self._lan_ip_cache = ip
+        return ip
+
+    def invalidate_network_cache(self) -> None:
+        """网络环境可能变了（换网卡 / 改端口）时调用，下次刷新重算本机地址。"""
+        self._lan_ip_cache = None
+
+    def invalidate_patch_cache(self) -> None:
+        """网关目录/补丁状态可能变了（重装、换目录、补丁体检）时调用。"""
+        self._patch_cache = None
 
     def _ts_url(self) -> str:
         host = self.ctx.config.get("funnel.hostname") or ""
@@ -1759,15 +1963,27 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------- 客户端
 
     def _refresh_clients(self) -> None:
+        """Codex / Claude 接入片段。
+
+        ★ `QPlainTextEdit.setPlainText()` **没有**「内容相同就跳过」的短路 ——
+          它每次都重建整个 QTextDocument。而本函数会被 `state_changed` 反复触发，
+          片段内容却几乎不变，所以这里自己比一次再决定要不要写。
+        """
         st = self.ctx.codex.status()
         self.codex_dot.set_color(theme.OK if st["applied"] else theme.TEXT_MUTE)
         self.codex_status.setText(f"{st['reason']}\n{st['path']}")
-        self.codex_snippet.setPlainText(snippet_codex(self.ctx.config, with_key=True))
+        code = snippet_codex(self.ctx.config, with_key=True)
+        if code != self._codex_snippet_cache:
+            self._codex_snippet_cache = code
+            self.codex_snippet.setPlainText(code)
 
         st2 = self.ctx.claude.status()
         self.claude_dot.set_color(theme.OK if st2["applied"] else theme.TEXT_MUTE)
         self.claude_status.setText(f"{st2['reason']}\n{st2['path']}")
-        self.claude_snippet.setPlainText(snippet_claude(self.ctx.config))
+        code2 = snippet_claude(self.ctx.config)
+        if code2 != self._claude_snippet_cache:
+            self._claude_snippet_cache = code2
+            self.claude_snippet.setPlainText(code2)
 
     def _apply_codex(self) -> None:
         model = self.codex_model.currentText().strip()
@@ -2055,7 +2271,8 @@ class MainWindow(QMainWindow):
         if not new_py.exists():
             problems.append("解释器路径不存在")
         new_port = int(self.in_port.value())
-        if new_port != int(cfg.get("gateway.port")) and not port_free(new_port):
+        # fresh=True：这是「保存设置」的判定，拿真值，别吃 0.25s 的端口表缓存。
+        if new_port != int(cfg.get("gateway.port")) and not port_free(new_port, fresh=True):
             problems.append(f"端口 {new_port} 已被占用")
         if not self.in_key.text().strip():
             problems.append("API Key 不能为空")
@@ -2342,9 +2559,36 @@ class MainWindow(QMainWindow):
         if b is not None and ok:
             b.setEnabled(False)
 
+    def _fill_task_badge(self) -> None:
+        """填充「迁移与诊断」里的计划任务提示。
+
+        延后到窗口显示之后才跑（`_build` 里先摆了占位块）：这一步要起
+        `schtasks.exe` 子进程，同步放在构造期会拖慢首帧。
+        """
+        from ..gateway import scheduled_task_exists
+
+        ph = getattr(self, "_task_placeholder", None)
+        if ph is not None:
+            self._task_placeholder = None
+            self.task_badge_box.removeWidget(ph)
+            ph.deleteLater()
+
+        if scheduled_task_exists():
+            msg = QLabel("检测到旧部署的计划任务 codebuddy2api 仍存在，会和萝卜盒抢同一端口。")
+            msg.setObjectName("warnText")
+            msg.setWordWrap(True)
+            self.task_badge_box.addWidget(msg)
+            self.btn_del_task = _btn("移除旧计划任务", "danger")
+            # 这个按钮是延后创建的，就地接线（_connect 里那轮通用接线已经跑过了）
+            self.btn_del_task.clicked.connect(self._remove_old_task)
+            self.task_badge_box.addWidget(self.btn_del_task)
+        else:
+            self.task_badge_box.addWidget(QLabel("未检测到遗留的计划任务，环境干净。"))
+
     # ---------------------------------------------------------- 启动后自检
 
     def _post_show_checks(self) -> None:
+        self._fill_task_badge()
         warn = warn_scheduled_task(self.ctx.config)
         if warn:
             self._on_toast(warn, "warn", )

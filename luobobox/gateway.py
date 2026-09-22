@@ -89,8 +89,19 @@ def _http_json(
         return 0, str(exc)
 
 
-def listening_pids(port: int) -> list[int]:
-    """用 netstat 找出监听指定端口的 PID 列表。"""
+def listening_pids(port: int, *, fresh: bool = False) -> list[int]:
+    """找出监听指定端口的 PID 列表。
+
+    ★ 优先走 Windows 原生监听表（0.16ms，无子进程）。原来每次都拉一个
+    `netstat -ano -p TCP` 再逐行解析，单次约 228ms —— 而 UI 的
+    `gateway.pid` 属性每轮刷新都会调它，又是一处「卡」的来源。
+    """
+    from .winports import listening_pids as _native
+
+    native = _native(int(port), fresh=fresh)
+    if native is not None:
+        return native
+
     try:
         out = subprocess.run(
             ["netstat", "-ano", "-p", "TCP"],
@@ -156,6 +167,11 @@ class GatewayManager:
         self._log_handle = None
         self._state = STATE_STOPPED
         self._last_error = ""
+        # 健康探测的短缓存。`state` 与 `state_label` 每轮刷新各问一次，
+        # 而 `_refresh_state` + `_refresh_hero` 一轮就是两次 —— 不缓存的话
+        # 网关卡住时一次刷新能干等 2×2.5s（本机向未监听端口发包要等满超时）。
+        self._healthy_at = 0.0
+        self._healthy_last = False
 
     # ------------------------------------------------------------ 基本属性
 
@@ -173,10 +189,36 @@ class GatewayManager:
         if self._proc is not None and self._proc.poll() is None:
             if self._state in (STATE_STARTING, STATE_STOPPING):
                 return self._state
-            return STATE_RUNNING if self._is_healthy(quick=True) else STATE_STARTING
+            # ★ 端口还没监听就别发 HTTP —— 本机向未监听端口发请求要等满
+            #   超时（实测 2.5s），网关启动那几十秒里 UI 会被这一句卡死。
+            #   端口都没起，答案必然是 STARTING，直接用监听表（0.16ms）。
+            if not self.is_listening():
+                return STATE_STARTING
+            return STATE_RUNNING if self._health_quick() else STATE_STARTING
         if not port_free(self.port):
             return STATE_EXTERNAL
         return STATE_STOPPED
+
+    def _health_quick(self, ttl: float = 0.5) -> bool:
+        """带短缓存的健康检查，给高频读取的 `state` 用。"""
+        now = time.monotonic()
+        if now - self._healthy_at < ttl:
+            return self._healthy_last
+        ok = self._is_healthy(quick=True)
+        self._healthy_at = now
+        self._healthy_last = ok
+        return ok
+
+    def forget_health_cache(self) -> None:
+        self._healthy_at = 0.0
+        self._healthy_last = False
+
+    def _forget_port_caches(self) -> None:
+        """把端口表快照与健康判断一起作废，让状态立刻反映刚刚的动作。"""
+        from .winports import forget_port_cache
+
+        forget_port_cache()
+        self.forget_health_cache()
 
     @property
     def state_label(self) -> str:
@@ -216,7 +258,8 @@ class GatewayManager:
     def start(self, wait_seconds: int = 25) -> tuple[bool, str]:
         if self.owned:
             return True, "网关已在运行"
-        if not port_free(self.port):
+        # fresh=True：启停这种决定性的判断不吃 0.25s 的短缓存，要真值。
+        if not port_free(self.port, fresh=True):
             # 端口被占 ≠ 一定是别人的。stop_on_exit 默认 false，退出萝卜盒时网关会
             # 作为独立子进程活下来 —— 于是"重启萝卜盒"必然撞上自己上一次拉起的网关。
             # 这时直接报"端口已被占用"会弹一个红色失败提示，其实服务好好的。
@@ -265,6 +308,7 @@ class GatewayManager:
             return False, f"启动失败：{exc}"
 
         self._state = STATE_STARTING
+        self._forget_port_caches()
         ok, detail = self.wait_healthy(timeout=wait_seconds)
         if ok:
             self._state = STATE_RUNNING
@@ -297,7 +341,8 @@ class GatewayManager:
             self._proc = None
 
         # 端口上可能还残留别的进程（例如计划任务拉起的旧实例）
-        pids = listening_pids(self.port)
+        # fresh=True：这里要给用户报"还占着"的真实 PID，不能吃缓存。
+        pids = listening_pids(self.port, fresh=True)
         if pids:
             if kill_external:
                 for pid in pids:
@@ -312,6 +357,7 @@ class GatewayManager:
 
         self._close_handle()
         self._state = STATE_STOPPED
+        self._forget_port_caches()
 
         # 计划任务托管的实例会随登录自动回来，提示用户
         if scheduled_task_exists():
@@ -423,7 +469,25 @@ class GatewayManager:
 TASK_NAME = "codebuddy2api"
 
 
+# 计划任务查询缓存：{任务名: (查询时刻, 是否存在)}
+_task_exists_cache: dict[str, tuple[float, bool]] = {}
+_TASK_EXISTS_TTL_SEC = 20.0
+
+
 def scheduled_task_exists(name: str = TASK_NAME) -> bool:
+    """系统里有没有同名计划任务。
+
+    ★ 带短 TTL 缓存：底层是一次 `schtasks.exe` 进程（冷启动几百毫秒到一两秒），
+      而 UI 会在启动后自检里问它、诊断卡片又问它 —— 一次启动就是两三个进程。
+      计划任务属于"装了/删了才变"的东西，缓存 20 秒完全够；
+      删除任务后用 `forget_scheduled_task_cache()` 显式失效。
+    """
+    now = time.monotonic()
+    hit = _task_exists_cache.get(name)
+    if hit is not None and now - hit[0] < _TASK_EXISTS_TTL_SEC:
+        return hit[1]
+
+    exists = False
     try:
         r = subprocess.run(
             ["schtasks", "/query", "/tn", name],
@@ -431,9 +495,17 @@ def scheduled_task_exists(name: str = TASK_NAME) -> bool:
             encoding="utf-8", errors="replace",
             creationflags=CREATE_NO_WINDOW,
         )
-        return r.returncode == 0
+        exists = r.returncode == 0
     except Exception:  # noqa: BLE001
-        return False
+        exists = False
+
+    _task_exists_cache[name] = (now, exists)
+    return exists
+
+
+def forget_scheduled_task_cache(name: str = TASK_NAME) -> None:
+    """删除/新建计划任务后调用，让下次查询重新走 schtasks。"""
+    _task_exists_cache.pop(name, None)
 
 
 def remove_scheduled_task(name: str = TASK_NAME) -> tuple[bool, str]:
@@ -445,6 +517,9 @@ def remove_scheduled_task(name: str = TASK_NAME) -> tuple[bool, str]:
             creationflags=CREATE_NO_WINDOW,
         )
         ok = r.returncode == 0
+        if ok:
+            # 删掉了就让缓存失效，否则 20 秒内还会说"任务存在"
+            forget_scheduled_task_cache(name)
         return ok, (r.stdout or r.stderr or "").strip()
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)

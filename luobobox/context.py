@@ -247,7 +247,9 @@ class AppContext(QObject):
         from .config import port_free
 
         port = int(cfg.get("gateway.port", 8788) or 0)
-        if port > 0 and not port_free(port):
+        # fresh=True：这里会**改配置**（挪端口），必须拿真值。
+        # 吃 0.25s 的端口表缓存会导致"刚被占用的端口看不见" → 该挪的不挪。
+        if port > 0 and not port_free(port, fresh=True):
             # 端口被占 ≠ 要挪走。先探测占着的是不是一个健康的网关 ——
             # 计划任务/旧脚本拉起的实例就常驻在这。无脑挪端口会让
             # 签到/余额/凭证全部打到空端口上（真实踩坑：8788 被外部

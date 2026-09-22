@@ -7,7 +7,6 @@ from pathlib import Path
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QDialog,
     QFormLayout,
@@ -24,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import theme
+from .widgets import IOSSwitch
 from .. import __version__, autostart
 from ..config import gen_api_key, port_free
 from ..paths import find_python, icon_path, is_gateway_dir
@@ -397,7 +397,7 @@ class FirstRunWizard(QDialog):
         from .widgets import Card
 
         card = Card("Codex（桌面版 / CLI）")
-        self.w_codex = QCheckBox("接入 Codex")
+        self.w_codex = IOSSwitch("接入 Codex")
         self.w_codex.setChecked(True)
         card.add(self.w_codex)
         row = QHBoxLayout()
@@ -417,7 +417,7 @@ class FirstRunWizard(QDialog):
         box.addWidget(card)
 
         card2 = Card("Claude Code / Anthropic 兼容")
-        self.w_claude = QCheckBox("接入 Claude Code")
+        self.w_claude = IOSSwitch("接入 Claude Code")
         card2.add(self.w_claude)
         note2 = QLabel("写入 ~/.claude/settings.json 的 env 段。"
                        "如果你用的是 CC Switch 这类切换器，也可以只复制片段手动粘贴。")
@@ -446,18 +446,18 @@ class FirstRunWizard(QDialog):
         from .widgets import Card
 
         card = Card("开机与常驻")
-        self.w_autostart = QCheckBox("开机自启（登录时自动运行萝卜盒）")
-        self.w_gw_auto = QCheckBox("启动萝卜盒时自动拉起网关")
+        self.w_autostart = IOSSwitch("开机自启（登录时自动运行萝卜盒）")
+        self.w_gw_auto = IOSSwitch("启动萝卜盒时自动拉起网关")
         self.w_gw_auto.setChecked(True)
-        self.w_min_tray = QCheckBox("关闭窗口时最小化到托盘，不退出")
+        self.w_min_tray = IOSSwitch("关闭窗口时最小化到托盘，不退出")
         self.w_min_tray.setChecked(True)
-        self.w_stop_exit = QCheckBox("退出萝卜盒时同时停止网关")
+        self.w_stop_exit = IOSSwitch("退出萝卜盒时同时停止网关")
         for c in (self.w_autostart, self.w_gw_auto, self.w_min_tray, self.w_stop_exit):
             card.add(c)
         box.addWidget(card)
 
         card2 = Card("公网入口（可选）")
-        self.w_funnel = QCheckBox("开启 Tailscale Funnel，让外网也能用")
+        self.w_funnel = IOSSwitch("开启 Tailscale Funnel，让外网也能用")
         card2.add(self.w_funnel)
         warn = QLabel("提醒：公网开启后，唯一的防线就是 API Key。"
                       "网关本身没有限流和配额，Key 一旦泄露会被无成本消耗订阅额度。"
@@ -510,7 +510,8 @@ class FirstRunWizard(QDialog):
             self._warn("Python 解释器路径不存在，请点「自动探测」，或从下方链接下载安装。")
             return False
         port = int(self.w_port.value())
-        if not port_free(port):
+        # fresh=True：向导「下一步」的判定，要真值（原生表 0.16ms，随便问）
+        if not port_free(port, fresh=True):
             self._warn(f"端口 {port} 已被占用，请换一个（试试 {port + 1}）。")
             return False
         if not self.w_key.text().strip():
@@ -634,7 +635,9 @@ class FirstRunWizard(QDialog):
         self.btn_next.setEnabled(True)
 
     def _port_changed(self, value: int) -> None:
-        if not port_free(value):
+        # 点一下微调箭头就问一次：走的是原生端口表（0.16ms），
+        # 以前是 connect_ex 干等 617ms —— 调端口时会明显一顿。
+        if not port_free(value, fresh=True):
             self._warn(f"端口 {value} 已被占用。")
 
     def _skip(self) -> None:

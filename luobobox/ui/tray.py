@@ -36,6 +36,8 @@ class TrayController(QObject):
         # 角标文案：既接住窗口**后续**的回调，也接住"托盘创建**之前**
         # 就已经检查出更新"的情况（那种情况下窗口属性已经有值、回调却不会再来）。
         self._badge = str(getattr(window, "update_badge", "") or "")
+        # 托盘图标缓存：见 _icon()
+        self._icons: dict[str, QIcon] = {}
 
         self.tray = QSystemTrayIcon(self._icon("stopped"), app)
         self.tray.setToolTip(f"萝卜盒 {__version__}")
@@ -57,12 +59,24 @@ class TrayController(QObject):
     # ---------------------------------------------------------------- 图标
 
     def _icon(self, state: str) -> QIcon:
+        """按状态取托盘图标。
+
+        ★ 缓存：`refresh()` 挂在 `state_changed` 上（每个任务起止都会触发），
+          而 `QIcon(str(path))` 是一次真实的磁盘读取 + PNG 解码。
+          图标只有那几张、状态也就几个，缓存起来一次都不该重复加载。
+        """
+        hit = self._icons.get(state)
+        if hit is not None:
+            return hit
         name = ICON_FILES.get(state, "tray_off.png")
         path = resource_dir() / name
         if path.is_file():
-            return QIcon(str(path))
-        fallback = icon_path()
-        return QIcon(str(fallback)) if fallback.is_file() else QIcon()
+            icon = QIcon(str(path))
+        else:
+            fallback = icon_path()
+            icon = QIcon(str(fallback)) if fallback.is_file() else QIcon()
+        self._icons[state] = icon
+        return icon
 
     # ---------------------------------------------------------------- 菜单
 

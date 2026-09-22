@@ -108,7 +108,7 @@ def main() -> int:
     from luobobox.paths import default_gateway_dir
     from luobobox.ui import charts, motion, palette, theme
     from luobobox.ui.main_window import TAB_PRIMARY, MainWindow, health_label
-    from luobobox.ui.widgets import EmptyState, StatusDot, StatusRing, Toast
+    from luobobox.ui.widgets import EmptyState, IOSSwitch, StatusDot, StatusRing, Toast
 
     app.setStyleSheet(theme.stylesheet())
 
@@ -227,6 +227,19 @@ def main() -> int:
                 combos += 1
     check("8 套配色全部生成合法样式表", combos == 8, combos)
 
+    # 两套调色板的键集合必须完全一致：QSS 是无条件按 pal['XXX'] 取的，
+    # 只在一边加键（比如只给 dark 加 FIELD_BG）会在另一套上直接 KeyError ——
+    # 而 KeyError 的触发点是"切到浅色"，测试不切就永远看不见。
+    key_sets = {name: set(pal) for name, pal in theme.PALETTES.items()}
+    names = sorted(key_sets)
+    check("两套调色板键集合一致",
+          len({frozenset(s) for s in key_sets.values()}) == 1,
+          {n: sorted(key_sets[n] ^ key_sets[names[0]]) for n in names[1:]})
+    # QSS 引用的每个键都必须真的存在（拼错键名 = 启动即崩）
+    used = set(re.findall(r"c\['([A-Z_]+)'\]", theme.stylesheet()))
+    check("QSS 引用的配色键全部存在",
+          used <= key_sets[names[0]], sorted(used - key_sets[names[0]]))
+
     scales_ok = True
     for step in theme.SCALE_STEPS:
         theme.apply(scale=step)
@@ -250,16 +263,18 @@ def main() -> int:
           theme.pt(13) == round(13 * 0.75), f"pt(13)={theme.pt(13)}")
 
     # 颜色必须是"活"的：切到浅色后 health_label 立即跟着变
+    # 注意：这两个期望值跟着 iOS 调色板走（深色 systemRed / 浅色可读红）。
+    # 改 PALETTES 时必须同步这里 —— 否则这里通过、主题其实没生效。
     theme.apply(palette="dark", accent="rooboo", scale=1.0)
     dark_err = health_label("error")[1]
     theme.apply(palette="light")
     light_err = health_label("error")[1]
     check("health_label 颜色随主题变化（不是被 dict 冻住的）",
-          dark_err != light_err and dark_err == "#F09595" and light_err == "#B42318",
+          dark_err != light_err and dark_err == "#FF453A" and light_err == "#D70015",
           f"{dark_err} -> {light_err}")
     check("状态词映射正确", health_label("ready")[0] == "正常"
           and health_label("禁用态") [0] == "禁用态")
-    check("status_color 也随主题变化", theme.status_color("running") == "#0F7A57",
+    check("status_color 也随主题变化", theme.status_color("running") == "#248A3D",
           theme.status_color("running"))
 
     # 真正走一遍换肤入口
@@ -328,6 +343,76 @@ def main() -> int:
     check("英雄区主按钮有动态文案",
           win.hero_btn_start.text() in ("启动网关", "停止网关"),
           win.hero_btn_start.text())
+
+    # ============================================================ F2 iOS 部件
+    section("F2. iOS 开关 / 分段式导航")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QCheckBox
+
+    sw = IOSSwitch("测试开关")
+    # ★ 这条是整个替换方案的地基：16 处调用点（含本文件后面的
+    #   `win.chk_log_regex.setChecked`）一行都没改，靠的就是继承关系。
+    check("IOSSwitch 仍是 QCheckBox（调用点无需改动）", isinstance(sw, QCheckBox))
+    got: list = []
+    sw.toggled.connect(got.append)
+    sw.setChecked(True)
+    check("开关可勾选并派发 toggled", sw.isChecked() and got == [True])
+    sw.setChecked(False)
+    check("开关可取消勾选", not sw.isChecked() and got == [True, False])
+
+    # 文字没被压掉：sizeHint 必须为滑轨 + 间距 + 文本留够宽度。
+    text_w = sw.fontMetrics().horizontalAdvance(sw.text())
+    check("开关 sizeHint 留够滑轨与文字的宽度",
+          sw.sizeHint().width() >= IOSSwitch.TRACK_W + IOSSwitch.GAP + text_w,
+          f"{sw.sizeHint().width()} vs {IOSSwitch.TRACK_W + IOSSwitch.GAP + text_w}")
+    check("开关不会被压扁（固定高度）",
+          sw.minimumSizeHint().height() >= IOSSwitch.TRACK_H)
+
+    # 两种状态 × 两套调色板都要能画出来。自绘控件的典型坑是
+    # 换肤后不重绘、或者某套配色下取到不存在的键直接 KeyError。
+    paint_ok = True
+    detail = ""
+    for pname in theme.PALETTES:
+        theme.apply(palette=pname, accent="rooboo", scale=1.0)
+        for state in (False, True):
+            sw.setChecked(state)
+            pm = sw.grab()
+            if pm.isNull() or pm.width() < IOSSwitch.TRACK_W:
+                paint_ok = False
+                detail = f"{pname}/{state} -> {pm.width()}x{pm.height()}"
+    check("开关在两套调色板 × 两种状态下都能渲染", paint_ok, detail)
+
+    # SWITCH_OFF（关闭态滑轨色）必须两套调色板都有 —— 少一个就是 KeyError。
+    check("两套调色板都定义了 SWITCH_OFF",
+          all("SWITCH_OFF" in p for p in theme.PALETTES.values()))
+    theme.apply(palette="dark", accent="rooboo", scale=1.0)
+
+    # 迁移彻底性：ui/ 下不该再有人直接 new QCheckBox（否则两套开关观感不一致）
+    # 正则要求 QCheckBox( 前面是行首或 = ( , 空格 —— 避免把 docstring 里
+    # 那句「`QCheckBox(...)` 的创建点」也当成真实调用（前面是反引号）。
+    _mk = re.compile(r"(^|[=(,\s])QCheckBox\(", re.M)
+    leftovers = []
+    for src in (BASE / "luobobox" / "ui").glob("*.py"):
+        if _mk.search(src.read_text(encoding="utf-8")):
+            leftovers.append(src.name)
+    check("ui/ 下不再直接创建 QCheckBox", not leftovers, leftovers)
+
+    # 分段控件的轨道：普通 QWidget 不开 WA_StyledBackground 就不画 QSS 背景，
+    # 结果"轨道"凭空消失、只剩几个孤立按钮 —— 这个坑必须钉住。
+    check("分段导航容器开了 WA_StyledBackground",
+          win._nav_host.testAttribute(Qt.WA_StyledBackground))
+    check("分段导航容器有 segmented objectName",
+          win._nav_host.objectName() == "segmented")
+    check("分段导航轨道比按钮高（有内缩留白）",
+          win._nav_host.height() >= win._nav_buttons["overview"].height(),
+          f"{win._nav_host.height()} vs {win._nav_buttons['overview'].height()}")
+
+    # QSS 里若写了 QWidget#segmented 却漏了 WA_StyledBackground，
+    # 上面那条会挂 —— 反过来也要确认 QSS 真的给轨道配了背景色。
+    seg_qss = re.search(r"QWidget#segmented\s*\{([^}]*)\}", theme.stylesheet())
+    check("QSS 给分段轨道配了背景色",
+          bool(seg_qss) and "background-color" in seg_qss.group(1),
+          seg_qss.group(1).strip()[:60] if seg_qss else "段未找到")
 
     # ============================================================ G 接入包
     section("G. 一键复制接入包")

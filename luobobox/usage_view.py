@@ -94,6 +94,9 @@ class UsageTab(QWidget):
         self.usage_data: dict = {}
         self._last_summary: dict | None = None
         self._last_snap = None
+        # 不可见期间攒下的渲染请求：切回本页时由 showEvent 补上（见 refresh）
+        self._render_pending = True
+        self._creds_sig: tuple | None = None
         self._build()
         # 每次健康刷新后自动更新
         ctx.health_ready.connect(self.refresh)
@@ -211,11 +214,30 @@ class UsageTab(QWidget):
     # ---------------------------------------------------------- 刷新
 
     def refresh(self, snap) -> None:
+        """记录快照（每轮都做）+ 渲染（仅本页可见时做）。
+
+        ★ 记录**不能**省：这是额度曲线的采样，跳过就丢数据。
+          但渲染可以省 —— 环图/柱图重绘 + 表格逐格重建，每 15 秒来一次
+          （哪怕用户正停在别的页签）纯属浪费。切回本页时 showEvent 补渲染。
+        """
         self._last_snap = snap
         try:
             self.usage_data = usage.record_snapshot(snap) or {}
         except Exception:  # noqa: BLE001
             self.usage_data = self.usage_data or {}
+        if not self.isVisible():
+            self._render_pending = True
+            return
+        self._render()
+
+    def showEvent(self, event) -> None:  # noqa: N802, D102
+        super().showEvent(event)
+        if self._render_pending and self._last_snap is not None:
+            self._render()
+
+    def _render(self) -> None:
+        """纯渲染：把当前 usage_data 铺到环图 / 柱图 / 表格上。"""
+        self._render_pending = False
         data = self.usage_data
         s = usage.summary(data)
         self._last_summary = s
@@ -227,7 +249,7 @@ class UsageTab(QWidget):
 
         self._render_donut(s)
         self._render_chart()
-        self._fill_table(snap, data)
+        self._fill_table(self._last_snap, data)
 
     def _render_donut(self, s: dict) -> None:
         remain = float(s.get("total_remaining") or 0.0)
@@ -278,6 +300,9 @@ class UsageTab(QWidget):
             return
 
         self.cred_stack.setCurrentIndex(0)
+        # ★ 批量填充期间关掉重绘：每次 setItem 之后布局都可能被重算，
+        #   行数一多就变成逐格卡顿。
+        self.cred_table.setUpdatesEnabled(False)
         self.cred_table.setRowCount(len(rows))
         for r, item in enumerate(rows):
             # 逐行兜底：某一行字段形态异常只标记这一行，不拖垮整张表
@@ -320,6 +345,7 @@ class UsageTab(QWidget):
                     self.cred_table.setItem(r, 4, QTableWidgetItem("该行数据无法解析"))
                 except Exception:  # noqa: BLE001
                     pass
+        self.cred_table.setUpdatesEnabled(True)
 
 
 def build_usage_tab(ctx: AppContext) -> QWidget:

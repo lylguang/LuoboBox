@@ -269,13 +269,36 @@ def _stamp() -> str:
     return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
-def port_free(port: int, host: str = "127.0.0.1") -> bool:
+def port_free(port: int, host: str = "127.0.0.1", *,
+              fresh: bool = False) -> bool:
+    """端口是否空闲（没人监听）。
+
+    ★ 这条路必须走 Windows 原生监听表，不能用连接探测。
+    本机向 loopback 上的**空闲**端口 connect_ex 不会拿到 RST —— SYN 被丢
+    掉，要等满超时才回 WSAEWOULDBLOCK(10035)，实测 timeout=0.6 就是
+    614.6ms/次（对比原生表 0.164ms）。UI 每刷新一轮要问 3 次，一轮就是
+    两秒，这才是「特别的卡」的真正来源。
+    `fresh=True` 用于启停这种必须拿真值的场合，绕开 0.25s 的短缓存。
+    """
+    from .winports import port_in_use as _native_in_use
+
+    native = _native_in_use(int(port), fresh=fresh)
+    if native is not None:
+        return not native
+    # 回退（非 Windows / iphlpapi 不可用）：超时压到 0.15s，
+    # 空闲端口本来就要等满超时，0.6s 纯属浪费。
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(0.6)
-        return s.connect_ex((host, port)) != 0
+        s.settimeout(0.15)
+        return s.connect_ex((host, int(port))) != 0
 
 
 def pick_free_port(start: int = 8788, tries: int = 200) -> int:
+    from .winports import listening_table
+
+    # 先取一份新鲜快照再开扫：整轮候选都基于同一份端口表。
+    # 既避免"扫到一半世界变了"，也避免挑出一个 0.25s 前刚被别人占上的端口。
+    # （原生表可用时这一步是 0.16ms；不可用则退回逐端口连接探测。）
+    listening_table(fresh=True)
     for port in range(start, start + tries):
         if port_free(port):
             return port

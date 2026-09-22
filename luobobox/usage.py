@@ -90,6 +90,7 @@ def record_snapshot(snap: Any) -> dict:
     today = date.today().isoformat()
 
     creds = getattr(snap, "credentials", None) or []
+    changed = False
     for item in creds:
         if not isinstance(item, dict):
             continue
@@ -108,11 +109,19 @@ def record_snapshot(snap: Any) -> dict:
                 "daily": {},  # {iso_date: 当日首次余额}
             }
             accounts[key] = rec
+            changed = True
         if today not in rec["daily"]:
             rec["daily"][today] = bal
-        rec["last_balance"] = bal
+            changed = True
+        if rec["last_balance"] != bal:
+            rec["last_balance"] = bal
+            changed = True
 
-    save(data)
+    # ★ 只在记录真的变了才落盘。本函数由健康轮询驱动（默认 15 秒一次），
+    #   而账户余额常常几十分钟不动 —— 每次都 json.dumps + write_text
+    #   是纯浪费，而且这一步还跑在 UI 线程上。
+    if changed:
+        save(data)
     return data
 
 

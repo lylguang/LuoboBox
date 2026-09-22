@@ -20,69 +20,81 @@
 from __future__ import annotations
 
 DARK = {
-    "BG": "#17181A",
-    "BG_ALT": "#1E2023",
-    "SURFACE": "#242629",
-    "SURFACE_HI": "#2C2F33",
-    "BORDER": "#34383D",
-    "BORDER_HI": "#454A50",
-    "TEXT": "#E8EAED",
-    "TEXT_DIM": "#A8AEB6",
-    "TEXT_MUTE": "#767D86",
-    "OK": "#5DCAA5",          # 运行中 / 正常
-    "WARN": "#EF9F27",        # 警告
-    "ERR": "#F09595",         # 错误
-    "INFO": "#85B7EB",        # 信息
-    "HOVER": "#363A3F",
-    "PRESSED": "#2A2D31",
-    "BORDER_HOVER": "#52585F",
-    "SCROLL_HOVER": "#5A6068",
-    "SELECTION": "#3A4855",
-    "DANGER_BG": "#2C1F1F",
-    "DANGER_BORDER": "#6B3232",
-    "DANGER_HOVER": "#3A2424",
-    "DISABLED_BG": "#4A2E24",
-    "DISABLED_TEXT": "#9C8478",
-    "HERO_BG": "#1C1E21",
-    "LOG_BG": "#1A1C1E",
+    # 命名照抄 iOS 语义色，方便对着 Apple HIG 核对：
+    # systemBackground / secondarySystemBackground / tertiarySystemBackground
+    "BG": "#000000",
+    "BG_ALT": "#1C1C1E",
+    "SURFACE": "#1C1C1E",
+    "SURFACE_HI": "#2C2C2E",
+    "BORDER": "#38383A",          # separator
+    "BORDER_HI": "#48484A",
+    "TEXT": "#FFFFFF",            # label
+    "TEXT_DIM": "#98989F",        # secondaryLabel
+    "TEXT_MUTE": "#6C6C70",       # tertiaryLabel（略提亮，保证小字可读）
+    "OK": "#30D158",              # systemGreen (dark)
+    "WARN": "#FF9F0A",            # systemOrange (dark)
+    "ERR": "#FF453A",             # systemRed (dark)
+    "INFO": "#0A84FF",            # systemBlue (dark)
+    "HOVER": "#2C2C2E",
+    "PRESSED": "#3A3A3C",
+    "BORDER_HOVER": "#5A5A5E",
+    "SCROLL_HOVER": "#636366",
+    "SELECTION": "#26456E",       # systemBlue 压在黑底上的 35% 近似
+    "DANGER_BG": "#2A1A19",
+    "DANGER_BORDER": "#5C2B27",
+    "DANGER_HOVER": "#3A2321",
+    "DISABLED_BG": "#3A3A3C",
+    "DISABLED_TEXT": "#7C7C80",
+    "HERO_BG": "#1C1C1E",
+    "LOG_BG": "#121214",
+    "SWITCH_OFF": "#39393D",      # UISwitch 关闭态滑轨
+    "FIELD_BG": "#2C2C2E",        # 卡片内嵌输入框的填充底（比卡片亮，读作"凹槽"）
+    "SEGMENT_TRACK": "#2C2C2E",   # UISegmentedControl 轨道
+    "SEGMENT_ON": "#48484A",      # 选中分段：iOS 深色下比轨道**更亮**
 }
 
 LIGHT = {
-    "BG": "#F5F6F8",
+    "BG": "#F2F2F7",              # systemGroupedBackground
     "BG_ALT": "#FFFFFF",
     "SURFACE": "#FFFFFF",
-    "SURFACE_HI": "#EEF0F3",
-    "BORDER": "#E0E2E7",
-    "BORDER_HI": "#C6C9D0",
-    "TEXT": "#1C1E22",
-    "TEXT_DIM": "#555C66",
-    "TEXT_MUTE": "#848B95",
-    "OK": "#0F7A57",
-    "WARN": "#9A5B02",
-    "ERR": "#B42318",
-    "INFO": "#175CD3",
-    "HOVER": "#E7E9ED",
-    "PRESSED": "#DCDEE3",
-    "BORDER_HOVER": "#A6AAB3",
-    "SCROLL_HOVER": "#A6AAB3",
-    "SELECTION": "#CBE0F7",
-    "DANGER_BG": "#FEF3F2",
-    "DANGER_BORDER": "#F2B8B3",
-    "DANGER_HOVER": "#FCE7E5",
-    "DISABLED_BG": "#EFD9D2",
-    "DISABLED_TEXT": "#AE8878",
+    "SURFACE_HI": "#F2F2F7",
+    "BORDER": "#D8D8DC",          # separator 的可见版（纯 C6C6C8 做描边偏重）
+    "BORDER_HI": "#C7C7CC",
+    "TEXT": "#000000",
+    "TEXT_DIM": "#6E6E73",        # secondaryLabel（压深一档换可读性）
+    "TEXT_MUTE": "#9C9CA1",       # tertiaryLabel
+    "OK": "#248A3D",              # systemGreen 可读版（#34C759 当正文太浅）
+    "WARN": "#C93400",
+    "ERR": "#D70015",
+    "INFO": "#0040DD",
+    "HOVER": "#E8E8ED",
+    "PRESSED": "#DDDDE2",
+    "BORDER_HOVER": "#AEAEB2",
+    "SCROLL_HOVER": "#AEAEB2",
+    "SELECTION": "#B8D8FF",
+    "DANGER_BG": "#FFF1F0",
+    "DANGER_BORDER": "#F3B5B0",
+    "DANGER_HOVER": "#FFE3E0",
+    "DISABLED_BG": "#E8E8ED",
+    "DISABLED_TEXT": "#AEAEB2",
     "HERO_BG": "#FFFFFF",
-    "LOG_BG": "#FBFBFC",
+    "LOG_BG": "#FBFBFD",
+    "SWITCH_OFF": "#E9E9EA",
+    "FIELD_BG": "#F2F2F7",        # 白卡片里的浅灰内嵌底
+    "SEGMENT_TRACK": "#E4E4E9",   # 浅色下轨道要比窗口底(#F2F2F7)略深才看得见
+    "SEGMENT_ON": "#FFFFFF",      # 选中分段抬成白片
 }
 
 PALETTES: dict[str, dict[str, str]] = {"dark": DARK, "light": LIGHT}
 
 # 强调色：每套自带按钮上的前景色 —— 青柠偏亮，铺白字读不清。
+# 除品牌色 rooboo 外，其余三套换成 iOS 系统色（systemGreen / systemPurple /
+# systemBlue），这样"iOS 风格"是默认可达的，而萝卜盒自己的红仍然是默认值。
 ACCENTS: dict[str, dict[str, str]] = {
     "rooboo": {"label": "萝卜红", "color": "#E06A4A", "fg": "#FFFFFF", "hover": "#E97A5C"},
-    "lime": {"label": "青柠", "color": "#8CBB2E", "fg": "#1A2205", "hover": "#9ACB3B"},
-    "violet": {"label": "电紫", "color": "#7C5CFF", "fg": "#FFFFFF", "hover": "#8B6EFF"},
-    "lake": {"label": "湖蓝", "color": "#2E9BD6", "fg": "#FFFFFF", "hover": "#41A8DF"},
+    "lime": {"label": "青柠", "color": "#34C759", "fg": "#0B2E14", "hover": "#4CD964"},
+    "violet": {"label": "电紫", "color": "#AF52DE", "fg": "#FFFFFF", "hover": "#BC6BE5"},
+    "lake": {"label": "湖蓝", "color": "#007AFF", "fg": "#FFFFFF", "hover": "#1A8CFF"},
 }
 
 DEFAULT_PALETTE = "dark"
@@ -244,41 +256,44 @@ QScrollArea > QWidget, QScrollArea > QWidget > QWidget {{
     background: transparent;
 }}
 
-QLabel#h1 {{ font-size: {p(19)}pt; font-weight: 500; }}
-QLabel#h2 {{ font-size: {p(15)}pt; font-weight: 500; }}
-QLabel#h3 {{ font-size: {p(13)}pt; font-weight: 500; }}
+/* ---- 字阶：按 iOS 的 Dynamic Type 比例映射到桌面基准 13 ----
+   Title2 22 / Headline 17 / Subheadline 14 / Body 13 / Footnote 12 */
+QLabel#h1 {{ font-size: {p(22)}pt; font-weight: 600; }}
+QLabel#h2 {{ font-size: {p(17)}pt; font-weight: 600; }}
+QLabel#h3 {{ font-size: {p(14)}pt; font-weight: 500; }}
 QLabel#dim {{ color: {c['TEXT_DIM']}; }}
 QLabel#mute {{ color: {c['TEXT_MUTE']}; font-size: {p(12)}pt; }}
 QLabel#mono {{ font-family: {MONO_FAMILY}; font-size: {p(12)}pt; color: {c['TEXT_DIM']}; }}
-QLabel#stat {{ font-size: {p(22)}pt; font-weight: 500; }}
+QLabel#stat {{ font-size: {p(28)}pt; font-weight: 600; }}
 QLabel#statLabel {{ color: {c['TEXT_MUTE']}; font-size: {p(12)}pt; }}
-QLabel#heroTitle {{ font-size: {p(20)}pt; font-weight: 500; }}
-QLabel#emptyTitle {{ font-size: {p(14)}pt; font-weight: 500; color: {c['TEXT_DIM']}; }}
-QLabel#emptyGlyph {{ color: {c['TEXT_MUTE']}; font-size: {p(24)}pt; }}
+QLabel#heroTitle {{ font-size: {p(24)}pt; font-weight: 600; }}
+QLabel#emptyTitle {{ font-size: {p(15)}pt; font-weight: 500; color: {c['TEXT_DIM']}; }}
+QLabel#emptyGlyph {{ color: {c['TEXT_MUTE']}; font-size: {p(26)}pt; }}
 /* 语义色文字（磁盘告警、旧计划任务提醒）：靠 objectName 吃样式，
    不能在各处 inline 写死 —— 那样换到浅色主题后还是深色版的橙。 */
 QLabel#warnText {{ color: {c['WARN']}; }}
 QLabel#errText {{ color: {c['ERR']}; }}
 
+/* ---- 卡片：iOS inset grouped，12 圆角 + 发丝描边 ---- */
 QFrame#card {{
     background-color: {c['SURFACE']};
     border: 1px solid {c['BORDER']};
-    border-radius: 10px;
+    border-radius: 12px;
 }}
 QFrame#cardHi {{
     background-color: {c['SURFACE_HI']};
-    border: 1px solid {c['BORDER_HI']};
-    border-radius: 10px;
+    border: 1px solid {c['BORDER']};
+    border-radius: 12px;
 }}
 QFrame#hero {{
     background-color: {c['HERO_BG']};
     border: 1px solid {c['BORDER']};
-    border-radius: 12px;
+    border-radius: 14px;
 }}
 QFrame#emptyState {{
-    background-color: {c['BG_ALT']};
+    background-color: {c['SURFACE']};
     border: 1px dashed {c['BORDER_HI']};
-    border-radius: 10px;
+    border-radius: 12px;
 }}
 QFrame#separator {{
     background-color: {c['BORDER']};
@@ -286,21 +301,23 @@ QFrame#separator {{
     border: none;
 }}
 
+/* ---- 按钮：iOS 圆角矩形。次级按钮走"填充灰"而不是描边 ---- */
 QPushButton {{
     background-color: {c['SURFACE_HI']};
-    border: 1px solid {c['BORDER_HI']};
-    border-radius: 7px;
+    border: 1px solid transparent;
+    border-radius: 9px;
     padding: 7px 16px;
+    font-weight: 500;
 }}
-QPushButton:hover {{ background-color: {c['HOVER']}; border-color: {c['BORDER_HOVER']}; }}
+QPushButton:hover {{ background-color: {c['HOVER']}; }}
 QPushButton:pressed {{ background-color: {c['PRESSED']}; }}
-QPushButton:disabled {{ color: {c['TEXT_MUTE']}; background-color: {c['BG_ALT']}; border-color: {c['BORDER']}; }}
+QPushButton:disabled {{ color: {c['TEXT_MUTE']}; background-color: {c['SURFACE']}; border-color: {c['BORDER']}; }}
 
 QPushButton#primary {{
     background-color: {c['ACCENT']};
     border: 1px solid {c['ACCENT']};
     color: {c['ACCENT_FG']};
-    font-weight: 500;
+    font-weight: 600;
 }}
 QPushButton#primary:hover {{ background-color: {c['ACCENT_HOVER']}; border-color: {c['ACCENT_HOVER']}; }}
 QPushButton#primary:disabled {{ background-color: {c['DISABLED_BG']}; border-color: {c['DISABLED_BG']}; color: {c['DISABLED_TEXT']}; }}
@@ -317,7 +334,7 @@ QPushButton#ghost:hover {{ background-color: {c['SURFACE_HI']}; }}
 QPushButton#iconBtn {{
     background-color: transparent;
     border: 1px solid transparent;
-    border-radius: 6px;
+    border-radius: 8px;
     padding: 4px 8px;
     color: {c['TEXT_DIM']};
 }}
@@ -330,16 +347,17 @@ QPushButton#toastClose {{
     color: {c['TEXT_MUTE']};
 }}
 
+/* ---- 输入：内嵌填充式（iOS 表单不靠描边，靠"比卡片亮/暗一档"） ---- */
 QLineEdit, QSpinBox, QComboBox, QPlainTextEdit, QTextEdit {{
-    background-color: {c['BG_ALT']};
+    background-color: {c['FIELD_BG']};
     border: 1px solid {c['BORDER']};
-    border-radius: 6px;
-    padding: 6px 9px;
+    border-radius: 9px;
+    padding: 7px 10px;
     selection-background-color: {c['SELECTION']};
 }}
 QLineEdit#mono {{ font-family: {MONO_FAMILY}; font-size: {p(12)}pt; }}
 QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QPlainTextEdit:focus {{
-    border-color: {c['INFO']};
+    border-color: {c['ACCENT']};
 }}
 QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{
     color: {c['TEXT_MUTE']};
@@ -352,27 +370,30 @@ QSpinBox::up-button, QSpinBox::down-button {{
 QSpinBox::up-arrow, QSpinBox::down-arrow {{ width: 0px; height: 0px; }}
 QComboBox QAbstractItemView {{
     background-color: {c['SURFACE']};
-    border: 1px solid {c['BORDER_HI']};
+    border: 1px solid {c['BORDER']};
+    border-radius: 10px;
     selection-background-color: {c['SURFACE_HI']};
     outline: none;
 }}
 
+/* 原生 QCheckBox 的方形指示器保留给残留调用点；
+   iOS 风格开关走 widgets.IOSSwitch，自己画滑轨，不吃这段。 */
 QCheckBox {{ spacing: 8px; }}
 QCheckBox::indicator {{
-    width: 15px; height: 15px;
+    width: 16px; height: 16px;
     border: 1px solid {c['BORDER_HI']};
-    border-radius: 4px;
-    background-color: {c['BG_ALT']};
+    border-radius: 5px;
+    background-color: {c['FIELD_BG']};
 }}
 QCheckBox::indicator:checked {{
     background-color: {c['ACCENT']};
     border-color: {c['ACCENT']};
 }}
-QCheckBox::indicator:hover {{ border-color: {c['INFO']}; }}
+QCheckBox::indicator:hover {{ border-color: {c['ACCENT']}; }}
 
 QTabWidget::pane {{
     border: 1px solid {c['BORDER']};
-    border-radius: 9px;
+    border-radius: 12px;
     top: -1px;
     background-color: {c['BG']};
 }}
@@ -382,8 +403,8 @@ QTabBar::tab {{
     margin-right: 2px;
     border: 1px solid transparent;
     border-bottom: none;
-    border-top-left-radius: 7px;
-    border-top-right-radius: 7px;
+    border-top-left-radius: 9px;
+    border-top-right-radius: 9px;
     color: {c['TEXT_DIM']};
 }}
 QTabBar::tab:selected {{
@@ -391,13 +412,13 @@ QTabBar::tab:selected {{
     border-color: {c['BORDER']};
     border-bottom: 1px solid {c['BG']};
     color: {c['TEXT']};
-    font-weight: 500;
+    font-weight: 600;
 }}
 QTabBar::tab:hover:!selected {{ color: {c['TEXT']}; }}
 
 QGroupBox {{
     border: 1px solid {c['BORDER']};
-    border-radius: 9px;
+    border-radius: 12px;
     margin-top: 14px;
     padding: 14px 12px 10px 12px;
     font-weight: 500;
@@ -409,23 +430,24 @@ QGroupBox::title {{
     color: {c['TEXT_DIM']};
 }}
 
+/* ---- 滚动条：iOS 覆盖式滚动条 —— 无轨道、圆头、只在悬停时显形 ---- */
 QScrollBar:vertical {{
-    background: transparent; width: 10px; margin: 0;
+    background: transparent; width: 9px; margin: 0;
 }}
 QScrollBar::handle:vertical {{
-    background: {c['BORDER_HI']}; border-radius: 5px; min-height: 30px;
+    background: {c['BORDER_HI']}; border-radius: 4px; min-height: 32px;
 }}
 QScrollBar::handle:vertical:hover {{ background: {c['SCROLL_HOVER']}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
-QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 0; }}
-QScrollBar::handle:horizontal {{ background: {c['BORDER_HI']}; border-radius: 5px; min-width: 30px; }}
+QScrollBar:horizontal {{ background: transparent; height: 9px; margin: 0; }}
+QScrollBar::handle:horizontal {{ background: {c['BORDER_HI']}; border-radius: 4px; min-width: 32px; }}
 
 QTableWidget {{
-    background-color: {c['BG_ALT']};
+    background-color: {c['SURFACE']};
     border: 1px solid {c['BORDER']};
-    border-radius: 8px;
-    gridline-color: {c['BORDER']};
+    border-radius: 12px;
+    gridline-color: transparent;
     selection-background-color: {c['SURFACE_HI']};
     selection-color: {c['TEXT']};
 }}
@@ -433,41 +455,41 @@ QHeaderView::section {{
     background-color: {c['SURFACE_HI']};
     border: none;
     border-bottom: 1px solid {c['BORDER']};
-    padding: 7px 9px;
+    padding: 8px 10px;
     color: {c['TEXT_DIM']};
     font-weight: 500;
 }}
-QTableWidget::item {{ padding: 5px; }}
+QTableWidget::item {{ padding: 6px; border-bottom: 1px solid {c['BORDER']}; }}
 QTableCornerButton::section {{ background-color: {c['SURFACE_HI']}; border: none; }}
 
 QMenu {{
     background-color: {c['SURFACE']};
-    border: 1px solid {c['BORDER_HI']};
-    border-radius: 8px;
-    padding: 5px;
+    border: 1px solid {c['BORDER']};
+    border-radius: 12px;
+    padding: 6px;
     font-size: {pt(13)}pt;
 }}
-QMenu::item {{ padding: 7px 26px 7px 14px; border-radius: 5px; }}
-QMenu::item:selected {{ background-color: {c['SURFACE_HI']}; }}
+QMenu::item {{ padding: 8px 26px 8px 14px; border-radius: 8px; }}
+QMenu::item:selected {{ background-color: {c['ACCENT']}; color: {c['ACCENT_FG']}; }}
 QMenu::item:disabled {{ color: {c['TEXT_MUTE']}; }}
 QMenu::separator {{ height: 1px; background: {c['BORDER']}; margin: 5px 8px; }}
 
 QToolTip {{
     background-color: {c['SURFACE_HI']};
     border: 1px solid {c['BORDER_HI']};
-    border-radius: 5px;
-    padding: 5px 8px;
+    border-radius: 8px;
+    padding: 6px 9px;
     color: {c['TEXT']};
 }}
 
 QProgressBar {{
-    background-color: {c['BG_ALT']};
-    border: 1px solid {c['BORDER']};
-    border-radius: 6px;
-    height: 6px;
+    background-color: {c['SURFACE_HI']};
+    border: none;
+    border-radius: 4px;
+    height: 7px;
     text-align: center;
 }}
-QProgressBar::chunk {{ background-color: {c['ACCENT']}; border-radius: 5px; }}
+QProgressBar::chunk {{ background-color: {c['ACCENT']}; border-radius: 4px; }}
 
 QStatusBar {{ background-color: {c['BG_ALT']}; border-top: 1px solid {c['BORDER']}; color: {c['TEXT_DIM']}; }}
 QStatusBar::item {{ border: none; }}
@@ -477,40 +499,47 @@ QSplitter::handle {{ background-color: {c['BORDER']}; }}
 QPlainTextEdit#logView {{
     background-color: {c['LOG_BG']};
     border: 1px solid {c['BORDER']};
-    border-radius: 8px;
+    border-radius: 12px;
     font-family: {MONO_FAMILY};
     font-size: {p(12)}pt;
 }}
 
-/* ---- 顶部导航：4 个主入口 + 「⋯」更多 ----
-   页签到 7 个之后，平铺 tab bar 变成"一排字"，扫不完。
-   分组的代价只是一层映射，收益是常用入口一眼可见。 */
+/* ---- 顶部导航 = iOS 分段控件（UISegmentedControl） ----
+   轨道是一块填充灰，选中项抬成一张"浮起来的白片"；
+   这比"给选中项刷主题色"更像 iOS，也不会让一屏里出现两块强调色。
+   注意：QWidget#segmented 必须在 Python 侧 setAttribute(WA_StyledBackground)，
+   否则普通 QWidget 不画 QSS 背景（Qt 的经典坑）。 */
+QWidget#segmented {{
+    background-color: {c['SEGMENT_TRACK']};
+    border: 1px solid {c['BORDER']};
+    border-radius: 11px;
+}}
 QPushButton#navBtn {{
     background-color: transparent;
     border: 1px solid transparent;
-    border-radius: 7px;
-    padding: 7px 15px;
+    border-radius: 8px;
+    padding: 6px 16px;
     color: {c['TEXT_DIM']};
-}}
-QPushButton#navBtn:hover {{ background-color: {c['SURFACE_HI']}; color: {c['TEXT']}; }}
-QPushButton#navBtn:checked {{
-    background-color: {c['SURFACE']};
-    border-color: {c['BORDER_HI']};
-    color: {c['TEXT']};
     font-weight: 500;
+}}
+QPushButton#navBtn:hover:!checked {{ color: {c['TEXT']}; }}
+QPushButton#navBtn:checked {{
+    background-color: {c['SEGMENT_ON']};
+    border-color: {c['BORDER']};
+    color: {c['TEXT']};
+    font-weight: 600;
 }}
 QPushButton#navMore {{
     background-color: transparent;
-    border: 1px solid transparent;
-    border-radius: 7px;
-    padding: 7px 12px;
+    border: 1px solid {c['BORDER']};
+    border-radius: 9px;
+    padding: 6px 13px;
     color: {c['TEXT_DIM']};
     font-weight: 500;
 }}
 QPushButton#navMore:hover {{ background-color: {c['SURFACE_HI']}; color: {c['TEXT']}; }}
 QPushButton#navMore:checked {{
-    background-color: {c['SURFACE']};
-    border-color: {c['BORDER_HI']};
+    background-color: {c['SURFACE_HI']};
     color: {c['TEXT']};
 }}
 
@@ -525,8 +554,8 @@ QDialog#palette {{
 QLineEdit#paletteInput {{
     background-color: {c['BG_ALT']};
     border: 1px solid {c['BORDER']};
-    border-radius: 8px;
-    padding: 10px 12px;
+    border-radius: 11px;
+    padding: 10px 13px;
     font-size: {p(15)}pt;
 }}
 QListWidget#paletteList {{
@@ -535,8 +564,8 @@ QListWidget#paletteList {{
     outline: none;
 }}
 QListWidget#paletteList::item {{
-    padding: 7px 10px;
-    border-radius: 6px;
+    padding: 8px 11px;
+    border-radius: 8px;
     color: {c['TEXT_DIM']};
 }}
 QListWidget#paletteList::item:selected {{

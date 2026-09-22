@@ -28,7 +28,7 @@ Funnel 挂了要手动 `tailscale funnel --bg` 重挂、服务莫名退出要看
 | **首屏状态环** | 96px 自绘状态环 + 大状态字 + 双主按钮，打开就知道「现在什么状态、下一步点哪」 |
 | **命令面板** | `Ctrl+K` 一个输入框模糊匹配**任意页签与动作**，不用记功能藏在哪个标签页 |
 | **全局快捷键** | `Ctrl+1..N` 切页签 · `Ctrl+K` 命令面板 · `Ctrl+R` 重启网关 · `Ctrl+Shift+C` 复制接入包 · `F5` 刷新 · `Ctrl+,` 设置 |
-| **外观与主题** | 暗 / 亮双基调 + **4 套强调色**（萝卜红 / 青柠 / 电紫 / 湖蓝）+ **三档字号**（标准 / 大 / 特大），切换即时生效，不用重启；窗口大小与位置自动记忆 |
+| **外观与主题** | **iOS 风格视觉**：暗 / 亮双基调（对着 Apple 系统语义色取色）+ **4 套强调色**（萝卜红 / 青柠 / 电紫 / 湖蓝）+ **三档字号**；分段控件式导航、自绘 iOS 开关、发丝分隔线、inset 分组卡片、iOS 字阶。切换即时生效，不用重启；窗口大小与位置自动记忆 |
 | **接入地址** | 本机 / 局域网 / Tailscale / 公网 四个地址一键复制，API Key 可显隐 |
 | **客户端自动化** | 一键写入 Codex `config.toml` 与 Claude Code `settings.json`，改前自动备份，可一键还原 |
 | **日志查看器** | 实时 tail 网关日志，关键字/正则过滤、**ERROR/WARN 分级着色**、自动滚动、清空、导出 |
@@ -166,6 +166,7 @@ luobobox/
 │   ├── paths.py           路径解析、数据目录迁移与指针自愈、Python 解释器探测
 │   ├── envsetup.py        一键配置环境：体检清单 + 逐项修复（纯逻辑，不依赖 Qt）
 │   ├── net.py             带代理回退的 HTTP 层（探活 + 逐通道失败原因）
+│   ├── winports.py        Windows 原生监听表（端口→PID，0.16ms；取代 connect_ex 探测与 netstat 子进程）
 │   ├── gateway.py         网关子进程生命周期、健康检查、日志
 │   ├── funnel.py          Tailscale Funnel 开关
 │   ├── clientconfig.py    Codex / Claude Code 配置的手术式改写与还原
@@ -178,8 +179,8 @@ luobobox/
 │   ├── usage_view.py      「额度消耗」页签
 │   ├── logging_setup.py   自身日志
 │   └── ui/
-│       ├── theme.py       主题引擎：暗 / 亮 × 4 强调色 × 三档字号，QSS 全量重建 + 热切换
-│       ├── widgets.py     通用部件（Pill / Toast / EmptyState / 状态点与状态环 / 日志分级高亮）
+│       ├── theme.py       主题引擎：iOS 风格暗 / 亮 × 4 强调色 × 三档字号，QSS 全量重建 + 热切换
+│       ├── widgets.py     通用部件（iOS 开关 / Pill / Toast / EmptyState / 状态点与状态环 / 日志分级高亮）
 │       ├── charts.py      纯 QPainter 图表（柱状图 / 环形图，不引第三方图表库）
 │       ├── motion.py      动效语言（淡入上移 / 滑入 / 高亮闪烁，无头环境自动降级）
 │       ├── palette.py     命令面板（Ctrl+K）的模糊匹配与动作清单
@@ -203,7 +204,7 @@ luobobox/
 # 所以要用装了 PySide6 的解释器跑，纯系统 Python 会在 [6b] 段报 ModuleNotFoundError
 python tests/selftest.py
 
-# GUI 布局 / 交互回归自测（181 项，无头可跑）
+# GUI 布局 / 交互回归自测（195 项，无头可跑）
 # 覆盖这一轮最容易悄悄坏掉的东西：页签注册表（绝不允许再出现
 # tabs.setCurrentIndex(<字面量>)）、导航分组、快捷键表与 tab_keys() 是否同步、
 # 主题引擎产出的样式表、空态、窗口几何记忆、动效降级、托盘新版本角标、
@@ -344,6 +345,14 @@ python tests/e2e_release_asset.py v1.0.3   # 校验指定 tag
 | 换肤只重建样式表 + 通知订阅者，不重建窗口 | 重建窗口会丢当前页签 / 滚动位置 / 输入内容。订阅者（`theme.on_change`）各自刷新自绘控件的颜色即可 |
 | 托盘的新版本角标**自己缓存**文案 | 让消费方去读生产方属性会踩时序：托盘 `refresh()` 早于/错开窗口属性更新时角标就丢了。回调进来的值就地存下来，构造时再从生产方读一次（覆盖"更新在托盘创建之前就已发现"） |
 | 主题 / 图表 / 动效全部自己实现，不引第三方 | 多一个依赖就多一个打包体积与升级风险；`QPainter` 画柱状图和环形图足够，还能直接吃主题变量 |
+| 端口占用一律问 **Windows 原生监听表**（`GetExtendedTcpTable`），不用 `connect_ex` | 本机（Windows）向 loopback 上的**空闲**端口 `connect_ex` **不会**立刻拿到 RST —— SYN 被直接丢掉，要等满超时才返回 `WSAEWOULDBLOCK(10035)`。实测 `timeout=0.6` 就是 **614.6ms/次**，而原生监听表是 **0.164ms**。UI 每刷新一轮要问 3 次「端口空不空」（`gateway.state` / `state_label` / `quick_state`），加上 `gateway.pid` → 每次拉一个 `netstat -ano` 子进程（约 228ms）—— 一轮两秒多，用户感知就是「卡」。原生表一次调用拿全表（端口 → PID），把 netstat 子进程也一起替掉 |
+| 原生监听表结果可以吃 0.25 秒短缓存，**但改配置/决定启停的判断必须 `fresh=True`** | 会**改配置**的调用点（`ensure_ready` 挪端口、`gateway.start` 预检、向导端口校验、`fix_port`）吃缓存会拿到"快照之后已经作废"的答案：实测 `ensure_ready` 吃缓存后「端口刚被占用」看不见 → 该挪的端口没挪（这一条是被自测套件抓出来的）。只读展示类调用点（状态显示 / 托盘）吃缓存换性能 |
+| 状态判定里「端口都还没监听」就**不要**发 HTTP 健康检查 | 本机向未监听端口发请求同样要等满超时（2.5s）。网关启动那几十秒里，每一次状态刷新都会被这一句卡住。先用监听表（0.164ms）判「端口起没起」，没起直接给 `STARTING`，答案一样但快一万倍。健康检查本身再叠一个 0.5s 短缓存（同一轮里 `state` 与 `state_label` 会各问一次） |
+| iOS 开关**继承** `QCheckBox` 自绘，而不是造新控件 | 全项目 16 处 `QCheckBox(...)` 创建点 + 一堆 `isChecked/setChecked/toggled` 调用点（含 195 项布局自测）。继承之后这些调用点一个字都不用改，`isinstance(w, QCheckBox)` 也继续成立；而 QSS 的 `::indicator` 只能画矩形/圆角块，做不出「圆钮在滑轨上平移」这件事 |
+| 自绘控件不要挂 `theme.on_change(self.update)`，改用 `changeEvent(StyleChange)` | `on_change` 的回调表只增不减，向导每开一次就多挂 7 个死控件的引用（向导是反复开关的对话框）—— 这是稳定的内存泄漏。`QApplication.setStyleSheet()` 会给所有控件派发 `StyleChange`，在那里 `update()` 既准确又不留引用 |
+| `QWidget#xxx` 要吃到 QSS 背景，必须 `setAttribute(WA_StyledBackground)` | 普通 `QWidget`（未重写 `paintEvent` 的子类）默认**不画** QSS 背景。分段控件的轨道就是一块 `QWidget`，漏了这句的表现是「轨道凭空消失、只剩几个孤立按钮」。`QFrame` 系（`Card` / `EmptyState`）没这个问题 |
+| 两套调色板的**键集合必须完全一致** | QSS 是无条件按 `pal['XXX']` 取色的。只在深色里加 `FIELD_BG`、忘了浅色，报错时机是「切到浅色」那一刻 —— 不切就永远看不见。自测里钉了这条，另外钉了「QSS 引用的每个键都真的存在」 |
+| 深/浅两套里「同一种角色」不能用同一个键 | 深色下 `BG_ALT` 与 `SURFACE` 同值（都是 `#1C1C1E`），输入框底色和卡片底色因此长得一模一样、只剩一圈描边 —— 而 iOS 表单靠「比卡片亮/暗一档」来表达内嵌。故拆出 `FIELD_BG` / `SEGMENT_TRACK` / `SEGMENT_ON`：深色下分段控件的选中片要比轨道**更亮**（`#48484A` vs `#2C2C2E`），浅色下则是白片压浅灰轨道 |
 
 ---
 
@@ -352,8 +361,14 @@ python tests/e2e_release_asset.py v1.0.3   # 校验指定 tag
 **Q：能换主题吗？字号太小 / 太大怎么办？**
 到「设置 → 外观」：暗 / 亮两种基调，4 套强调色（萝卜红 / 青柠 / 电紫 / 湖蓝），
 三档字号（标准 / 大 / 特大）。改完**立刻生效，不用重启**，选择会记住。
+整体视觉是 **iOS 风格**：纯色调背景 + inset 分组卡片、发丝分隔线、分段控件式
+顶部导航、自绘 iOS 开关；调色板直接对着 Apple 的系统语义色取（`systemGreen`
+`systemOrange` `systemRed` `systemBlue`、`secondaryLabel`、`separator` …），
+所以深浅两套都是"原生 iOS"那个味道，而不是随便配的灰。
 （**不跟随系统**：Qt 的 `QPalette` 机制管不到卡片描边、圆角、语义色这些样式表细节，
 两套机制混用只会打架，最后变成"亮色下有些地方还是黑的"。）
+（想要 iOS 那种蓝色色调，把强调色切到「湖蓝」= `#007AFF` 即可；默认仍是萝卜红，
+保留品牌色。）
 
 **Q：有快捷键吗？**
 `Ctrl+K` 命令面板（模糊搜任意功能，不用记菜单在哪）、`Ctrl+1..N` 按顺序切页签、

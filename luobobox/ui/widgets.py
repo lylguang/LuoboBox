@@ -6,7 +6,15 @@ import math
 import os
 import platform
 
-from PySide6.QtCore import QRectF, QRegularExpression, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QRectF,
+    QRegularExpression,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -18,6 +26,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -154,8 +163,10 @@ class KeyValue(QWidget):
         self.value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.value_label.setWordWrap(True)
         self.value_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        # 当前色值缓存，供 set_color 前置比较（见 Pill 里关于 setStyleSheet 成本的说明）
+        self._value_color = ""
         if value_color:
-            self.value_label.setStyleSheet(f"color: {value_color};")
+            self.set_color(value_color)
         row.addWidget(self.value_label, 1)
 
         if copyable:
@@ -173,6 +184,15 @@ class KeyValue(QWidget):
         return self.value_label.text()
 
     def set_color(self, color: str) -> None:
+        """★ 记忆化：见 `Pill` 的说明。
+
+        `_refresh_patch_badge()` 每轮都会调到这里，而 `_refresh_state()` 被
+        `state_changed` / health 轮询反复触发 —— 没有前置比较就是每轮一次
+        样式表重解析 + re-polish。
+        """
+        if color == self._value_color:
+            return
+        self._value_color = color
         self.value_label.setStyleSheet(f"color: {color};")
 
     def _copy(self) -> None:
@@ -180,18 +200,29 @@ class KeyValue(QWidget):
 
 
 class Pill(QLabel):
-    """小圆角标签，用于状态、数量、倍率。"""
+    """小圆角标签，用于状态、数量、倍率。
 
-    def __init__(self, text: str = "", color: str = theme.TEXT_DIM, parent=None):
+    ★ 颜色必须**记忆化**：`QWidget.setStyleSheet()` 哪怕内容一模一样也会让 Qt
+      重新解析样式表并 re-polish 自己（含子孙）。首屏英雄区有 4 个 pill，
+      而 `_refresh_state()` 在每次健康检查 / 每个任务起止时都会被调用 ——
+      不做记忆化就是每轮 4 次无谓的样式重解析，这是"用起来卡"的主要来源之一。
+    """
+
+    def __init__(self, text: str = "", color: str | None = None, parent=None):
         super().__init__(text, parent)
         self.setObjectName("pill")
         self.setAlignment(Qt.AlignCenter)
         self.setFixedHeight(22)
-        self.set_color(color)
+        # 默认色延后到构造时取，不写进函数默认值 —— 默认值在 import 期求值，
+        # 会把当时的颜色抠死，换肤后不生效。
+        self._color = ""
+        self.set_color(color or theme.TEXT_DIM)
 
     def set_color(self, color: str) -> None:
+        if color == self._color:
+            return
+        self._color = color
         bg = QColor(color)
-        bg.setAlpha(34)
         # 字号用 theme.pt()：QSS 里写 px 会让字体 pointSize() = -1，
         # Qt 内部算菜单字号时会报警；而且写死 px 也不跟随"特大字号"档位。
         self.setStyleSheet(
@@ -204,6 +235,94 @@ class Pill(QLabel):
         self.setText(text)
         if color:
             self.set_color(color)
+
+
+class IOSSwitch(QCheckBox):
+    """iOS 风格开关（自绘滑轨 + 圆钮）。
+
+    ★ 为什么继承 QCheckBox 而不是造一个新控件：全项目有 16 处
+      `QCheckBox(...)` 的创建点，外加 `isChecked() / setChecked() /
+      toggled / setEnabled` 的调用点（含 181 项布局自测）。继承之后
+      这些调用点**一个字都不用改**，`isinstance(w, QCheckBox)` 也继续成立。
+
+    ★ 为什么不用 QSS 画：`QCheckBox::indicator` 只能给出矩形/圆角块，
+      做不出"圆钮在滑轨上平移"这件事 —— 而 iOS 开关的识别度几乎全在
+      那个位置会变的白色圆钮上。
+
+    尺寸按 iOS 的 51×31 等比缩到桌面尺寸 46×28，键盘聚焦时补一圈焦点环
+    （自绘控件很容易把可达性画丢）。
+    """
+
+    TRACK_W = 46
+    TRACK_H = 28
+    THUMB = 24
+    GAP = 9            # 滑轨与文字的间距
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(self.TRACK_H + 2)
+
+    # --------------------------------------------------------- 尺寸
+    def sizeHint(self) -> QSize:  # noqa: N802
+        text_w = self.fontMetrics().horizontalAdvance(self.text()) if self.text() else 0
+        w = self.TRACK_W + (self.GAP + text_w if text_w else 0) + 2
+        return QSize(w, self.TRACK_H + 2)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return self.sizeHint()
+
+    # --------------------------------------------------------- 绘制
+    def changeEvent(self, event) -> None:  # noqa: N802
+        """换肤时主动重画。
+
+        自绘控件不吃 `app.setStyleSheet()` 的自动重绘；而**不能**在这里
+        `theme.on_change(self.update)` —— 那个回调表只增不减，向导每开一次
+        就多挂 7 个死控件的引用（向导是反复开关的对话框，这就是稳定的内存泄漏）。
+        """
+        super().changeEvent(event)
+        if event.type() == QEvent.StyleChange:
+            self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802, D102
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        on = self.isChecked()
+        enabled = self.isEnabled()
+        h = self.TRACK_H
+        y = (self.height() - h) / 2.0
+        r = h / 2.0
+
+        track = QColor(theme.ACCENT if on else theme.SWITCH_OFF)
+        if not enabled:
+            track.setAlpha(115)
+        p.setPen(Qt.NoPen)
+        p.setBrush(track)
+        p.drawRoundedRect(QRectF(0, y, self.TRACK_W, h), r, r)
+
+        # 圆钮：开启时贴右，关闭时贴左。iOS 的"状态变了"全靠这一下位移。
+        d = self.THUMB
+        x = self.TRACK_W - d - 2 if on else 2
+        thumb = QColor("#FFFFFF")
+        if not enabled:
+            thumb.setAlpha(190)
+        p.setBrush(thumb)
+        p.drawEllipse(QRectF(x, y + 2, d, d))
+
+        if self.text():
+            p.setPen(QColor(theme.TEXT if enabled else theme.TEXT_MUTE))
+            tx = self.TRACK_W + self.GAP
+            p.drawText(QRectF(tx, 0, max(0, self.width() - tx), self.height()),
+                       Qt.AlignLeft | Qt.AlignVCenter, self.text())
+
+        if self.hasFocus():
+            ring = QColor(theme.ACCENT)
+            ring.setAlpha(110)
+            pen = QPen(ring, 2)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(QRectF(1, y - 1, self.TRACK_W - 2, h + 2), r, r)
 
 
 class CopyField(QWidget):

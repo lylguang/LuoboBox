@@ -579,7 +579,7 @@ def gateway_port_item(cfg, *, deep: bool) -> Item:
     port = int(cfg.get("gateway.port", 0) or 0)
     if not (1 <= port <= 65535):
         return Item("port", "服务端口", "fix", f"{port} 不是合法端口", "自动换一个空闲端口")
-    if port_free(port):
+    if port_free(port, fresh=True):
         return Item("port", "服务端口", "ok", f"{port} 空闲")
 
     if deep and port_owner_is_gateway(port):
@@ -862,7 +862,8 @@ def fix_python(cfg, *, log=None, allow_install: bool = True,
 
 def fix_port(cfg, **_kw) -> tuple[bool, str]:
     port = int(cfg.get("gateway.port", 0) or 0)
-    if 1 <= port <= 65535 and port_free(port):
+    # fresh=True：这会真的改配置，必须拿真值
+    if 1 <= port <= 65535 and port_free(port, fresh=True):
         return True, f"端口 {port} 本来就空闲"
     start = port + 1 if 1 <= port <= 65534 else 8788
     new = pick_free_port(start)
