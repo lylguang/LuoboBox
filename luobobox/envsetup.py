@@ -48,6 +48,7 @@ from .paths import (
     data_dir,
     default_gateway_dir,
     find_python,
+    gateway_dir_from_process,
     is_gateway_dir,
     pointer_legacy_path,
     pointer_primary_path,
@@ -262,14 +263,21 @@ def pip_env() -> dict[str, str]:
 
 
 def locate_gateway_dir(cfg) -> Path | None:
-    """找一份可用的 codebuddy2api：先上次用过的，再常见位置。"""
+    """找一份可用的 codebuddy2api：先上次用过的，再常见位置，最后问正在跑的网关。
+
+    ★ 最后那一级不是锦上添花：「常见位置」是按 `app_root()` 逐级向上猜的，
+      用户把网关源码放在别的盘时必然猜不中 —— 于是这一项被判成 `fix`，
+      `fix_gateway_dir()` 就去**重新下一份**。可机器上很可能已经有一份正在
+      8789 上跑着（用户自己起的），再下一份既费流量、又留下两份互不同步的
+      源码。问一下那个进程的命令行，代价 1~2 秒，能省掉整次下载。
+    """
     remembered = Path(str(cfg.get("app.last_gateway_dir") or ""))
     if is_gateway_dir(remembered):
         return remembered
     candidate = default_gateway_dir()
     if is_gateway_dir(candidate):
         return candidate
-    return None
+    return gateway_dir_from_process()
 
 
 def _runs(python: Path) -> bool:

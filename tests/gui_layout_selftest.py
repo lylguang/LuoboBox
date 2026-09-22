@@ -843,6 +843,105 @@ def main() -> int:
     check("弹窗主文案给出下一步动作",
           "重试" in (_captured[0][2] if _captured else ""))
 
+    # ================================================ ZZ 网关目录定位
+    section("ZZ. 网关目录定位（别把猜出来的默认值当结果）")
+
+    from luobobox import paths as _paths
+    import luobobox.ui.wizard as wizard_mod
+
+    # 从命令行抠目录。真实命令行里 `pythonw.exe` 与网关路径**在同一行**，
+    # 早先那条「从第一个盘符开始吞」的正则会拼出半条命令行的垃圾路径，
+    # 而 is_gateway_dir() 会把它否掉 → 表现为"功能静默失效"。
+    # 目录自己造（含中文段），别写死本机真实路径 —— 否则这套自测换台机器就红。
+    _root = Path(tempfile.mkdtemp(prefix="luobobox-cmdline-")) / "反代工具"
+    _real_gw = _root / "codebuddy2api"
+    _real_gw.mkdir(parents=True)
+    (_real_gw / "converter.py").write_text("# fake gateway", encoding="utf-8")
+    _gwpy = str(_real_gw / "converter.py")
+    _real_cmd = (r"C:\Users\Administrator\.workbuddy\binaries\python\envs\default\Scripts\pythonw.exe "
+                 + _gwpy + " serve --host 0.0.0.0 --port 8789")
+    _gw_real = _paths._gateway_dir_in_cmdline(_real_cmd)
+    check("能从 pythonw + 中文路径的命令行里抠出网关目录",
+          _gw_real == _real_gw.resolve(), str(_gw_real))
+    check("抠出来的目录真的带 converter.py",
+          _gw_real is not None and (_gw_real / "converter.py").is_file())
+    check("引号包裹 / 正斜杠 的写法也能抠出来",
+          _paths._gateway_dir_in_cmdline('"' + _gwpy + '" serve') == _real_gw.resolve()
+          and _paths._gateway_dir_in_cmdline(
+              _real_gw.as_posix() + "/converter.py serve") == _real_gw.resolve())
+    check("抠不出来的一律 None（不瞎填一个坏路径给用户）",
+          all(_paths._gateway_dir_in_cmdline(c) is None for c in (
+              "", "python converter.py serve",
+              str(_root / "nope" / "converter.py") + " serve",
+              str(_root / "other.py") + " serve")))
+
+    # 端口也要抠得出来：只改目录不改端口，照向导点完就会在**同一份源码目录**上
+    # 再起一个实例，两个进程同时写同一份 auth/ 与 .env。
+    check("能从命令行里抠出 --port（两种写法 + 越界一律 None）",
+          _paths._gateway_port_in_cmdline(_real_cmd) == 8789
+          and _paths._gateway_port_in_cmdline("serve --port=65535") == 65535
+          and _paths._gateway_port_in_cmdline("serve --port 99999") is None
+          and _paths._gateway_port_in_cmdline("serve --host 0.0.0.0") is None,
+          str(_paths._gateway_port_in_cmdline(_real_cmd)))
+
+    # 三级顺序：当前配置 → 同级/上级 → 问进程。把前两级掐掉，确认第三级
+    # （唯一真正知情的那个）确实会被问到 —— 这正是用户那次卡住的地方。
+    _gwdir = Path(tempfile.mkdtemp(prefix="luobobox-gwdir-")) / "codebuddy2api"
+    _gwdir.mkdir(parents=True)
+    (_gwdir / "converter.py").write_text("# fake gateway", encoding="utf-8")
+    _o_cands = _paths.gateway_dir_candidates
+    _o_proc = _paths.gateway_from_process
+    _o_wiz_locate = wizard_mod.locate_gateway_dir
+    _o_warn = wz._warn
+    _paths.gateway_dir_candidates = lambda: [Path("C:/definitely/nope/codebuddy2api")]
+    try:
+        _paths.gateway_from_process = lambda timeout=12: None
+        check("全猜不中、也没有在跑的网关 → 三项都空，不编一个出来",
+              _paths.locate_gateway_dir("") == (None, "", None))
+
+        _paths.gateway_from_process = lambda timeout=12: (_gwdir, 9999)
+        _got, _why, _gp = _paths.locate_gateway_dir(r"C:\不存在的\codebuddy2api")
+        check("配置里是个不存在的路径时，会去问正在运行的网关（连端口一起回）",
+              _got == _gwdir.resolve() and _why == "正在运行的网关进程" and _gp == 9999,
+              f"{_got} / {_why} / {_gp}")
+
+        # 向导侧：进「运行环境」页会自动探测，目录与端口都要因此被改对。
+        wizard_mod.locate_gateway_dir = lambda cur=None: (
+            _gwdir.resolve(), "正在运行的网关进程", 9999)
+        try:
+            wz.w_dir.setText(
+                "C:\\Users\\Administrator\\AppData\\Local\\Programs\\LuoboBox\\codebuddy2api")
+            wz._probe()
+            check("自动探测把填错的网关目录改对了",
+                  Path(wz.w_dir.text()) == _gwdir.resolve(), wz.w_dir.text())
+            check("自动探测连端口一起采纳（否则同目录会起第二个实例）",
+                  int(wz.w_port.value()) == 9999, str(wz.w_port.value()))
+            check("探测结果里写明目录是从哪找到的",
+                  "正在运行的网关进程" in wz.probe_out.text(),
+                  wz.probe_out.text().splitlines()[0][:70] if wz.probe_out.text() else "")
+
+            # 「这个目录不存在」和「目录在、但没有 converter.py」要给不同的提示 ——
+            # 老版本只有后一句，于是"向导塞了个不存在的默认值"这种情况，
+            # 用户看到的是「请确认目录是否正确」，而那个目录从来不该被填进去。
+            warned: list = []
+            wz._warn = lambda t: warned.append(t)
+            wz.w_dir.setText("C:\\definitely\\not\\here")
+            wz._validate_runtime()
+            check("目录不存在时提示「不存在」而不是「找不到 converter.py」",
+                  bool(warned) and "不存在" in warned[0], str(warned[:1]))
+
+            wz.w_dir.setText(tempfile.mkdtemp(prefix="luobobox-notgw-"))
+            warned.clear()
+            wz._validate_runtime()
+            check("目录在但不是网关目录时说清缺的是 converter.py",
+                  bool(warned) and "converter.py" in warned[0], str(warned[:1]))
+        finally:
+            wizard_mod.locate_gateway_dir = _o_wiz_locate
+            wz._warn = _o_warn
+    finally:
+        _paths.gateway_dir_candidates = _o_cands
+        _paths.gateway_from_process = _o_proc
+
     # --- 回归：窗口比内容矮时，行**不能**被压塌。
     # 用户报过「运行环境页中间区域显示异常」：Python 输入框只剩 3px、「一键修复
     # 环境」和「下载安装包」被压成几像素并互相叠字。根因是每页都是固定高度布局，

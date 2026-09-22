@@ -26,7 +26,7 @@ from . import theme
 from .widgets import IOSSwitch
 from .. import __version__, autostart
 from ..config import gen_api_key, port_free
-from ..paths import find_python, icon_path, is_gateway_dir
+from ..paths import find_python, icon_path, is_gateway_dir, locate_gateway_dir
 
 STEPS = ["欢迎", "运行环境", "客户端", "启动方式"]
 
@@ -504,7 +504,15 @@ class FirstRunWizard(QDialog):
     def _validate_runtime(self) -> bool:
         gw = Path(self.w_dir.text().strip())
         if not is_gateway_dir(gw):
-            self._warn("网关目录里找不到 converter.py，请确认目录是否正确。")
+            # 分开说：路径压根不存在 vs 存在但不是网关目录。老版本只有后面那一句，
+            # 于是"向导把一个不存在的默认值填进去"这种情况，用户看到的是
+            # 「请确认目录是否正确」—— 而那个目录从来就不该被填进去。
+            if not gw.exists():
+                self._warn(f"这个目录不存在：{gw}\n点「自动探测」会自动定位网关目录"
+                           "（含正在运行的那个网关），也可以直接点「一键修复环境」。")
+            else:
+                self._warn("网关目录里找不到 converter.py，请确认目录是否正确"
+                           "（正确的网关源码目录里应该有 converter.py）。")
             return False
         if not Path(self.w_py.text().strip()).exists():
             self._warn("Python 解释器路径不存在，请点「自动探测」，或从下方链接下载安装。")
@@ -529,10 +537,32 @@ class FirstRunWizard(QDialog):
         from PySide6.QtWidgets import QApplication
 
         QApplication.processEvents()
+
+        lines: list[str] = []
+
+        # ---- 网关目录：先看现在填的，再看同级/上级，最后**问正在跑的网关进程** ----
+        # ★ 老行为只把 `default_gateway_dir()` 猜出来的那个路径（可能压根不存在）
+        #   填进输入框，用户点「下一步」只得到一句「找不到 converter.py」，
+        #   而他能做的只有自己去翻盘。可是机器上有人知道答案 —— 那个正在跑的
+        #   网关的命令行里就写着真实目录与端口。
+        cur = self.w_dir.text().strip()
+        gw, why, gw_port = locate_gateway_dir(cur)
+        if gw is not None:
+            if str(gw) != cur:
+                self.w_dir.setText(str(gw))
+            lines.append(f"✓ 网关目录（{why}）：{gw}")
+            # 采纳"运行中的那个网关"的端口。只改目录不改端口的话，照向导点完
+            # 会在**同一份源码目录**上再起一个实例，两个进程同时写同一份
+            # auth/ 与 .env —— 比端口冲突更难查。
+            if gw_port and int(self.w_port.value()) != gw_port:
+                self.w_port.setValue(gw_port)
+                lines.append(f"✓ 端口改为 {gw_port}（运行中的网关就在这个端口上）")
+        else:
+            lines.append("✗ 没找到网关源码目录 —— 可以手填，或点「一键修复环境」自动拉一份")
+
         py, report = find_python(self.w_py.text().strip() or None)
         # 候选里绝大多数是"这台机器上根本没这个路径"，全列出来只会淹没有用信息，
         # 折成一行计数；真正被检查过但不合格的（缺依赖 / 调用失败）才逐条显示。
-        lines: list[str] = []
         missing = 0
         for cand, why in report:
             if why == "文件不存在":
@@ -541,12 +571,16 @@ class FirstRunWizard(QDialog):
             lines.append(f"{'✓' if why == '可用' else '✗'} {cand}   {why}")
         if missing:
             lines.append(f"（另有 {missing} 个候选路径不存在，已省略）")
-        self.probe_out.setText("\n".join(lines[:8]) or "未发现任何 Python 解释器。")
+        self.probe_out.setText("\n".join(lines[:9]) or "未发现任何 Python 解释器。")
         if py:
             self.py_dl_tip.setVisible(False)
             self.w_py.setText(str(py))
             self.hint.setStyleSheet(f"color: {theme.OK};")
-            self.hint.setText(f"已选中可用解释器：{py}")
+            if gw is not None:
+                self.hint.setText(f"已定位网关目录与解释器：{gw.name} / {py.name}")
+            else:
+                self.hint.setText(f"已选中可用解释器：{py}")
+
             return
         # 没探到才把下载入口亮出来（这就是"自动适配"：有 Python 时界面不留噪音）。
         self.py_dl_tip.setVisible(True)

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -380,13 +381,8 @@ def unique_path(directory: Path, filename: str) -> Path:
 DEFAULT_GATEWAY_DIR_NAME = "codebuddy2api"
 
 
-def default_gateway_dir() -> Path:
-    """默认网关源码目录。
-
-    打包成 exe 后，网关通常**不在** exe 旁边（用户是把它放在别处的），
-    所以这里除了同级/上级，还逐级向上找 —— 遍历 dist/LuoboBox/dist/luobobox/
-    这样的层级后，一般能撞到用户真正的 codebuddy2api 目录。
-    """
+def gateway_dir_candidates() -> list[Path]:
+    """按「猜」的顺序列出可能的网关源码目录。"""
     candidates: list[Path] = []
     roots: list[Path] = []
 
@@ -415,14 +411,157 @@ def default_gateway_dir() -> Path:
         pass
 
     seen: set[str] = set()
+    out: list[Path] = []
     for c in candidates:
         key = str(c).lower()
         if key in seen:
             continue
         seen.add(key)
-        if (c / "converter.py").is_file():
+        out.append(c)
+    return out
+
+
+def default_gateway_dir() -> Path:
+    """默认网关源码目录。
+
+    打包成 exe 后，网关通常**不在** exe 旁边（用户是把它放在别处的），
+    所以这里除了同级/上级，还逐级向上找 —— 遍历 dist/LuoboBox/dist/luobobox/
+    这样的层级后，一般能撞到用户真正的 codebuddy2api 目录。
+
+    ⚠️ 全部猜不中时返回 `candidates[0]`（一个**可能并不存在**的路径）。这是刻意
+    的：`default_config()` 需要一个"看起来合理"的初值，真正该做的是把猜中的
+    这个"猜"字讲清楚 —— 见 `locate_gateway_dir()`，它会在放弃之前去问
+    **正在运行的网关进程**，那才是知情者。
+    """
+    candidates = gateway_dir_candidates()
+    for c in candidates:
+        if is_gateway_dir(c):
             return c.resolve()
     return candidates[0].resolve()
+
+
+def gateway_from_process(timeout: int = 12) -> tuple[Path, int | None] | None:
+    """问**正在运行的网关进程**：返回 ``(网关源码目录, 它的端口 或 None)``。
+
+    ★ 为什么要问进程：网关源码放在哪儿是用户的自由。靠 `app_root()` 逐级向上猜，
+      在「exe 装在默认位置、网关源码放在别的盘」这种最常见的组合下必然猜错 ——
+      表现为向导把一个**不存在的路径**填进输入框，提示只有一句
+      「网关目录里找不到 converter.py，请确认目录是否正确」，而用户能做的只有
+      自己去找。可是机器上明明有人知道答案：那个正在跑的网关，它的命令行里
+      就写着 `<网关目录>\\converter.py serve --host … --port …`。
+
+    ★ 为什么连端口一起回：只把目录改对、端口留在默认值，照着向导点完就会在
+      **同一份源码目录**上再起一个实例 —— 两个进程同时写同一份 `auth/`、`.env`，
+      比端口冲突更难查。既然认了"运行中的那个网关"作为目标，它的端口也得认。
+
+    这条路径**会起一个 PowerShell**（约 1~3 秒），所以只在明确的"定位"动作里调
+      （向导的自动探测、一键修复），不要放进任何会被高频调用的默认值函数。
+    """
+    import subprocess
+
+    # 服务端过滤（只回带 converter.py 的进程），避免把几百个进程的行都传回来；
+    # [Console]::OutputEncoding 必须先设成 UTF-8 —— 中文用户名/路径在 GBK 控制台
+    # 下会变成一堆问号，反推出的路径也就废了。
+    ps = (
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+        "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.CommandLine -like '*converter.py*' } | "
+        "Select-Object -First 8 -ExpandProperty CommandLine"
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=timeout,
+            encoding="utf-8", errors="replace",
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if proc.returncode != 0:
+        return None
+
+    for line in (proc.stdout or "").splitlines():
+        found = _gateway_dir_in_cmdline(line)
+        if found is not None:
+            return found, _gateway_port_in_cmdline(line)
+    return None
+
+
+def gateway_dir_from_process(timeout: int = 12) -> Path | None:
+    """只要目录（`gateway_from_process` 的薄包装，给不关心端口的调用方用）。"""
+    got = gateway_from_process(timeout=timeout)
+    return got[0] if got else None
+
+
+def _gateway_port_in_cmdline(cmdline: str) -> int | None:
+    """从命令行里抠出 `--port N` / `--port=N`。抠不到返回 None（不猜）。"""
+    m = re.search(r"--port[=\s]+(\d{1,5})", cmdline or "")
+    if not m:
+        return None
+    port = int(m.group(1))
+    return port if 1 <= port <= 65535 else None
+
+
+def _gateway_dir_in_cmdline(cmdline: str) -> Path | None:
+    """从一条命令行里抠出 `.../converter.py` 前面的那个目录，并验证它真的成立。
+
+    写成独立纯函数是为了能被自测直接覆盖。**按 token 取，不用正则扫整条** ——
+    实测踩过：正则 `([A-Za-z]:[\\/][^"']*?)[\\/]converter\\.py` 会从命令行里
+    **第一个**盘符开始吞，于是
+
+        C:\\…\\Scripts\\pythonw.exe F:\\…\\反代工具\\codebuddy2api\\converter.py serve …
+        └────────────── 被整段当成目录名 ──────────────┘
+
+    得到的是拼了半条命令行的垃圾路径。按空白/引号切开、只认「以 converter.py
+    结尾的那个参数」才是对的。
+    """
+    if not cmdline:
+        return None
+
+    tokens = re.findall(r'"([^"]+)"', cmdline)          # 带引号的（可含空格）
+    tokens += [t for t in cmdline.split() if '"' not in t]  # 裸 token
+
+    for tok in tokens:
+        if not tok.lower().endswith("converter.py"):
+            continue
+        # 只认真的成立的那个目录 —— 抠错一点就当作没找到，
+        # 而不是把一个坏路径填给用户。
+        cand = Path(tok).parent
+        if is_gateway_dir(cand):
+            return cand.resolve()
+    return None
+
+
+def locate_gateway_dir(current: str | Path | None = None
+                       ) -> tuple[Path | None, str, int | None]:
+    """尽量定位网关源码目录，返回 ``(目录 或 None, 来源说明, 端口 或 None)``。
+
+    顺序体现的是"可信度递减 + 代价递增"：
+      ① 当前配置里填的（如果它真的成立）
+      ② 同级 / 上级 / 数据目录逐级猜（纯文件系统，很便宜）
+      ③ **问正在运行的网关进程**（要起 PowerShell，但它是唯一真正知情的）
+    全部落空才返回 ``(None, "", None)``，由调用方决定怎么提示 —— 不再把猜出来的
+    默认值当成结果。
+
+    端口只在第 ③ 种来源下才有值（别人的命令行里写着），前两种来源回答不了
+    "那个网关跑在哪个端口上"。
+    """
+    if current:
+        cand = Path(str(current))
+        if is_gateway_dir(cand):
+            return cand.resolve(), "当前配置", None
+
+    for cand in gateway_dir_candidates():
+        if is_gateway_dir(cand):
+            return cand.resolve(), "同级 / 上级目录", None
+
+    got = gateway_from_process()
+    if got is not None:
+        # 三级分支都要给出**同一种形态**的路径。命令行的路径不一定被规范化
+        # （本机 Temp 就常带 8.3 短名 `ADMINI~1`），一处 resolve 一处不 resolve
+        # 会让调用方拿到两种写法、比较起来以为"换目录了"。
+        return got[0].resolve(), "正在运行的网关进程", got[1]
+    return None, "", None
 
 
 def is_gateway_dir(path: Path | str) -> bool:
