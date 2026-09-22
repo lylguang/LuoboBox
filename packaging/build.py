@@ -264,6 +264,10 @@ Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=lowest
+; 安装前由我们自己结束正在运行的托盘应用（见文件末尾 [Code] PrepareToInstall）。
+; 这里保持 yes，让 Restart Manager 退化成「其它文件被占用」的第二道网；因为进程
+; 已被我们先杀掉，它不会再弹「以下程序正在使用需要更新的文件」那个选择框。
+CloseApplications=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 SetupIconFile={ROOT / 'assets' / 'icon.ico'}
@@ -278,7 +282,12 @@ Name: "autostart"; Description: "开机自启（登录时启动萝卜盒）"; Fl
 Name: "desktopicon"; Description: "创建桌面快捷方式"; Flags: unchecked
 
 [Files]
-Source: "{ROOT / 'dist' / 'LuoboBox'}\\*"; DestDir: "{{app}}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; restartreplace = 第三道网：万一某个文件最终仍被占用，登记为「重启后再替换」，
+; 而不是直接以 "DeleteFile failed; code 5 拒绝访问" 硬失败。
+; 官方说明：该标记在**非管理员**权限下不生效（建议 PrivilegesRequired=admin 时用）。
+; 我们为了不弹 UAC、并支持装到 D:\\ 这类用户可写目录，坚持 lowest，
+; 所以它只在用户恰好以管理员身份运行时兜底 —— 真正吃劲的是 [Code] 里的确定性杀进程。
+Source: "{ROOT / 'dist' / 'LuoboBox'}\\*"; DestDir: "{{app}}"; Flags: ignoreversion recursesubdirs createallsubdirs restartreplace
 
 [Icons]
 Name: "{{group}}\\{{#AppName}}"; Filename: "{{app}}\\{{#AppExe}}"
@@ -297,6 +306,118 @@ Filename: "{{app}}\\{{#AppExe}}"; Description: "立即运行 {{#AppName}}"; \\
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{{app}}"
+
+[Code]
+// ===========================================================================
+// 安装前：确定性结束正在运行的萝卜盒主程序
+//
+// 症状：手动重装时先弹「以下程序正在使用需要更新的文件: LuoboBox.exe」，
+//       点掉之后变成「DeleteFile failed; code 5. 拒绝访问。」，安装失败。
+//
+// 根因链（四环）：
+//   1. 应用开了「最小化到托盘」→ closeEvent 里 event.ignore() + hide()，
+//      窗口关了但进程还活着（这正是托盘应用的设计行为，不是 bug）。
+//   2. Inno 默认 CloseApplications=yes 走 Windows Restart Manager 关进程，
+//      而 RM 只会发 WM_CLOSE —— 被 1 的 ignore() 吃掉，等于没关。
+//   3. LuoboBox.exe 的映像还映射着，[Files] 的 CreateFile(GENERIC_WRITE)
+//      拿到 ERROR_SHARING_VIOLATION(32)。
+//   4. [Files] 没带 restartreplace，Inno 没有「重启后再替换」的退路，
+//      重试若干次后直接以 code 5 硬失败。
+//
+// 为什么自更新没这毛病、手动重装才有：
+//   自更新是「应用先退出自己 → 再由助手 cmd 静默装」，第 1 环天然不成立；
+//   手动重装是人对着正在运行的托盘应用点安装。
+//
+// 修法：在 Setup 做占用检查**之前**由我们自己把进程结束掉。官方保证
+//   PrepareToInstall 的调用时机早于 in-use 检查，于是 Restart Manager 那一步
+//   再也找不到占用者，弹窗与 code 5 一起消失；RM 仍留作第二道网。
+//
+// 判据为何可信：taskkill 在「进程不存在」时退出码恒为 128（本机实测，
+//   /F 与优雅模式一致），成功终止为 0 —— 于是 128 就是「已经退干净」。
+//
+// 注意：一律**不带 /T**。LuoboBox.exe 会托管独立的网关子进程，/T 会顺手把
+//   长驻服务一起杀掉（见 windows-persistent-local-service 的记录）。
+// ===========================================================================
+
+function LuoboBoxExePath(): String;
+begin
+  Result := ExpandConstant('{{app}}\\{{#AppExe}}');
+end;
+
+// 探测 + 优雅请求退出：不带 /F 只发 WM_CLOSE。
+// 返回 True 表示「进程已不在运行」。
+function LuoboBoxGone(): Boolean;
+var
+  ResultCode: Integer;
+begin
+  ResultCode := -1;  // Exec 起不来时别沿用上一轮的 128（会误判成已退出）
+  if not Exec('taskkill.exe', '/IM {{#AppExe}}', '', SW_HIDE,
+              ewWaitUntilTerminated, ResultCode) then
+  begin
+    Result := False;
+    Exit;
+  end;
+  Result := (ResultCode = 128);
+end;
+
+// 返回 True 表示最终确认进程已退出。
+function EndLuoboBox(): Boolean;
+var
+  Attempt: Integer;
+  ResultCode: Integer;
+begin
+  Result := False;
+
+  // 第 1 轮：先礼。反复优雅请求，最多约 3 秒，给它自己退出的机会。
+  for Attempt := 1 to 4 do
+  begin
+    if LuoboBoxGone() then
+    begin
+      Result := True;
+      Exit;
+    end;
+    Sleep(750);
+  end;
+
+  // 第 2 轮：后兵。强制结束，最多再约 9 秒。
+  for Attempt := 1 to 12 do
+  begin
+    ResultCode := -1;
+    if Exec('taskkill.exe', '/F /IM {{#AppExe}}', '', SW_HIDE,
+            ewWaitUntilTerminated, ResultCode) then
+    begin
+      if ResultCode = 128 then
+      begin
+        Result := True;
+        Exit;
+      end;
+    end;
+    Sleep(750);
+  end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  NeedsRestart := False;
+  Result := '';  // 恒不阻断安装
+
+  // 全新安装（目标目录里没有旧 exe）→ 没有进程可杀，快速返回。
+  if not FileExists(LuoboBoxExePath()) then
+    Exit;
+
+  if EndLuoboBox() then
+  begin
+    Log('结束正在运行的 {{#AppExe}}：成功。');
+  end
+  else
+  begin
+    // 杀不掉（典型：进程以管理员身份运行，而我们是非提权安装）。
+    // 不阻断：交给 Restart Manager 与 [Files] 的 restartreplace 兜底，
+    // 并留下一条比 "code 5" 可读得多的日志。
+    Log('警告：{{#AppExe}} 仍在运行且无法结束，安装可能失败。'
+        + '请手动退出萝卜盒（托盘图标 - 退出）后重试。');
+  end;
+end;
 """,
         encoding="utf-8",
     )
