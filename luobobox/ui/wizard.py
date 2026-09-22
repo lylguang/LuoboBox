@@ -11,10 +11,12 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QStackedWidget,
     QVBoxLayout,
@@ -27,6 +29,73 @@ from ..config import gen_api_key, port_free
 from ..paths import find_python, icon_path, is_gateway_dir
 
 STEPS = ["欢迎", "运行环境", "客户端", "启动方式"]
+
+
+def _scrollable(content: QWidget) -> QScrollArea:
+    """把一页内容装进可滚动容器。
+
+    没有它的时候每页都是「固定高度布局」：页里内容一旦比窗口高，Qt 不会
+    溢出、而是**把每一行压扁**去凑高度 —— 「运行环境」页上就表现为 Python
+    输入框只剩 3px、说明文字被裁成细条互相压在一起，看着像界面坏了。
+
+    为什么一定会撞上：向导窗口是在 exec() 时按**当时**的 sizeHint 定死的，
+    之后内容再长高也不会自动变大。而「一键修复环境」跑完会往 probe_out
+    回填最多 12 行体检日志，Python 没探到时还要多出一块下载提示 ——
+    这两件事都发生在窗口已经定死之后，于是一挤就塌。
+
+    装了滚动区之后：空间够时外观与原来完全一致（无边框、背景透明，
+    theme 里已有 QScrollArea 的透明规则），不够时出滚动条，行不再被压。
+    """
+    area = QScrollArea()
+    area.setWidget(content)
+    area.setWidgetResizable(True)
+    area.setFrameShape(QFrame.NoFrame)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+    area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+    return area
+
+
+class _AutoHeightLabel(QLabel):
+    """wordWrap 的 QLabel 会把自己压到「一行」高，文字被裁掉、却不出现滚动条。
+
+    `minimumSizeHint()` 对换行标签只给一行的高度，所以布局可以合法地把它压到
+    比 `sizeHint()` 矮 —— 实测 probe_out 被压到 140px（需要 168px），最后一行
+    正好被裁掉。而「一键修复环境」失败时程序明确提示用户
+    「还有项目没修好，看下方清单**最后一行**」—— 把最后一行裁掉，
+    这句提示就变成了谎言。
+
+    这里把最小高度钉在「按当前宽度换行后真正需要的高度」上：空间够就完整显示，
+    不够就由外层滚动区出滚动条，永远不裁字。
+    """
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setWordWrap(True)
+        self._pinning = False
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._pin_min_height()
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        super().setText(text)
+        self._pin_min_height()
+
+    def _pin_min_height(self) -> None:
+        # setMinimumHeight 会再触发一次 resizeEvent，加个闸门防自激。
+        if self._pinning:
+            return
+        width = self.width()
+        if width <= 0:
+            return
+        needed = self.heightForWidth(width)
+        if needed <= 0 or needed == self.minimumHeight():
+            return
+        self._pinning = True
+        try:
+            self.setMinimumHeight(needed)
+        finally:
+            self._pinning = False
 
 HINTS = [
     f"版本 {__version__}　·　点击「下一步」开始，约 1 分钟。",
@@ -104,6 +173,23 @@ class FirstRunWizard(QDialog):
         self.env_logged.connect(self._append_env_log)
         self._build()
         self._goto(0)
+        self._fit_initial_size()
+
+    def _fit_initial_size(self) -> None:
+        """开局就把窗口开大一点，别等体检日志灌进去才开始挤。
+
+        dialog 的尺寸只在 exec() 时定一次；「运行环境」页自然高度约 600px，
+        比默认 sizeHint 给的高度还高，所以初始就该给足，滚轮只在极端情况出现。
+        """
+        from PySide6.QtWidgets import QApplication
+
+        scr = self.screen() or QApplication.primaryScreen()
+        avail = scr.availableGeometry() if scr else None
+        width, height = 780, 770
+        if avail is not None:
+            width = min(width, max(660, avail.width() - 80))
+            height = min(height, max(560, avail.height() - 80))
+        self.resize(width, height)
 
     # ---------------------------------------------------------------- 构建
 
@@ -122,10 +208,11 @@ class FirstRunWizard(QDialog):
         self.hint.setWordWrap(True)
 
         self.stack = QStackedWidget()
-        self.stack.addWidget(self._step_welcome())
-        self.stack.addWidget(self._step_runtime())
-        self.stack.addWidget(self._step_clients())
-        self.stack.addWidget(self._step_launch())
+        # 每一页都套滚动区，否则内容长高（体检日志最长 12 行）会把行压塌，
+        # 详见 _scrollable 的说明。顺序必须与 STEPS 一致。
+        for builder in (self._step_welcome, self._step_runtime,
+                        self._step_clients, self._step_launch):
+            self.stack.addWidget(_scrollable(builder()))
         root.addWidget(self.stack, 1)
 
         root.addWidget(self.hint)
@@ -284,9 +371,8 @@ class FirstRunWizard(QDialog):
         card.add_layout(form)
         box.addWidget(card)
 
-        self.probe_out = QLabel("")
+        self.probe_out = _AutoHeightLabel("")
         self.probe_out.setObjectName("mono")
-        self.probe_out.setWordWrap(True)
         box.addWidget(self.probe_out)
         box.addStretch(1)
 

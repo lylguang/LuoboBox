@@ -667,6 +667,73 @@ def main() -> int:
     wz._append_env_log("向导日志")
     check("向导日志能落到提示区",
           "向导日志" in wz.probe_out.text(), wz.probe_out.text())
+
+    # --- 回归：窗口比内容矮时，行**不能**被压塌。
+    # 用户报过「运行环境页中间区域显示异常」：Python 输入框只剩 3px、「一键修复
+    # 环境」和「下载安装包」被压成几像素并互相叠字。根因是每页都是固定高度布局，
+    # 内容（体检日志最多 12 行 + 缺 Python 时多出的提示块）一旦超过窗口高度，
+    # Qt 不会溢出而是把每一行压扁。修法：每页套可滚动容器 + 把 probe_out 的
+    # 最小高度钉死在「按当前宽度换行后真正需要的高度」。
+    from PySide6.QtWidgets import QScrollArea
+
+    wz._goto(1)  # noqa: SLF001
+    # ⚠ 必须 show()：没走过布局的 QWidget 还是默认 640×480，行高断言会
+    # 「因为根本没布局」而假通过（实测过 —— 三行都报 h=480）。offscreen 下
+    # show 不会弹窗。
+    wz.show()
+    for _ in range(8):
+        app.processEvents()
+    wz.resize(660, 560)          # 逼到最小尺寸，强制走滚动分支
+    wz._probe()
+    wz._append_env_log("\n".join(f"第 {i} 行体检输出" for i in range(1, 13)))
+    for _ in range(8):
+        app.processEvents()
+
+    import luobobox.ui.wizard as _wizard
+
+    _orig_find_python = _wizard.find_python
+    # 模拟「这台机器上没有可用的 Python」—— 正是用户截图里的情形：探测失败才会
+    # 亮出下载提示块，也才会把这一页撑到最高（缺 Python + 一屏日志同时出现）。
+    # 不模拟的话本机（装了 Python）永远走不到这条分支。
+    _wizard.find_python = lambda preferred=None: (  # noqa: ARG005
+        None, [(Path(r"C:\Program Files\Python312\python.exe"), "缺依赖：fastapi、uvicorn")])
+    try:
+        wz._probe()
+        wz._append_env_log("\n".join(f"第 {i} 行体检输出" for i in range(1, 13)))
+        for _ in range(8):
+            app.processEvents()
+
+        check("运行环境页套了可滚动容器", isinstance(wz.stack.widget(1), QScrollArea),
+              type(wz.stack.widget(1)).__name__)
+        area = wz.stack.widget(1)
+        check("内容超高时走滚动，而不是压缩内容",
+              area.verticalScrollBar().maximum() > 0,
+              f"max={area.verticalScrollBar().maximum()}")
+
+        check("缺 Python 时下载提示块自动亮出", wz.py_dl_tip.isVisible())
+
+        def row_ok(widget) -> bool:
+            """行没被压塌、而且确实布局过（排除未布局时的 480 默认值）。"""
+            h = widget.height()
+            return 40 <= h <= 200
+
+        pw = wz.w_py.parentWidget()
+        check("窄窗口下 Python 行不被压塌（输入框/按钮还在）", row_ok(pw),
+              f"h={pw.height()} hint={pw.sizeHint().height()}")
+        fixed_row = wz.btn_env_fix.parentWidget()
+        check("窄窗口下「一键修复环境」行不被压塌", row_ok(fixed_row),
+              f"h={fixed_row.height()} hint={fixed_row.sizeHint().height()}")
+        tip_h = wz.py_dl_tip.height()
+        check("窄窗口下「下载安装包」提示块不被压塌", row_ok(wz.py_dl_tip), f"h={tip_h}")
+
+        # probe_out 不能只按「一行」高就交差 —— 一键修复失败时程序让用户
+        # 「看下方清单最后一行」，裁掉最后一行等于把这句提示变成谎言。
+        need = wz.probe_out.heightForWidth(wz.probe_out.width())
+        log_h = wz.probe_out.height()
+        check("体检日志不被裁字（高度 ≥ 换行后所需）",
+              40 <= log_h <= 400 and log_h >= need, f"h={log_h} 需要={need}")
+    finally:
+        _wizard.find_python = _orig_find_python
     wz.deleteLater()
 
     # ============================================================ 收尾
