@@ -7,6 +7,6 @@
   3. 所有用户态数据放 %LOCALAPPDATA%\\LuoboBox，卸载时一删即净。
 """
 
-__version__ = "1.1.4"
+__version__ = "1.1.5"
 APP_NAME = "萝卜盒"
 APP_NAME_EN = "LuoboBox"

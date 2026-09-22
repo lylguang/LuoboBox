@@ -238,6 +238,76 @@ class GatewayManager:
     def owned(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    # ---- 启动失败时，把子进程的真实死因捞回来给用户看 ----
+    #
+    # 实测归因（2026-09-23，真 pythonw.exe + CREATE_NO_WINDOW，见 tests/selftest）：
+    #   · 退出码 1 = 子进程抛了未捕获异常（或自己 sys.exit(1)）
+    #   · 退出码 2 = argparse 参数被拒（把 --port 写成非数字就是 2）
+    #   · 端口被占 / 解释器缺依赖 **都不会**退出，会正常起来
+    # 于是"退出码 1"必然伴随一段 traceback —— 而那段 traceback 早就被
+    # stdout 重定向进 gateway.log 了，只是以前一个字都不给用户看，
+    # 失败提示只能报一句"进程提前退出（退出码 1）"，用户完全无从下手。
+
+    EXIT_CODE_HINT = {
+        1: "子进程启动时抛了未捕获异常（依赖缺失 / 配置项非法都会这样）",
+        2: "启动参数被拒绝，通常是端口填成了非数字",
+        3: "解释器路径或脚本参数不对",
+    }
+
+    @staticmethod
+    def exit_code_hint(code: int | None) -> str:
+        """退出码 → 人话。认不出来就返回空串，绝不瞎猜。"""
+        if code is None:
+            return ""
+        special = GatewayManager.EXIT_CODE_HINT.get(code)
+        if special:
+            return special
+        # Windows 上被控制台关闭（CTRL_CLOSE_EVENT）/ 任务管理器带走的进程
+        # 会给出 0xC000013A 这类大正数；POSIX 语义下则是负数（信号）。
+        if code < 0 or code >= 0xC0000000:
+            return "子进程被系统或信号强制结束（控制台被关掉会这样）"
+        return ""
+
+    @staticmethod
+    def failure_cause(text: str, max_len: int = 240) -> str:
+        """从子进程输出里挑出"最像原因"的那一行。
+
+        traceback 的收尾行就是异常本身（`RuntimeError: xxx`），优先挑最后
+        一条；挑不到才退回最后一行非空内容 —— 只给一行，提示条要能读完。
+        """
+        lines = [ln.strip() for ln in (text or "").splitlines()]
+        lines = [ln for ln in lines if ln]
+        if not lines:
+            return ""
+        for ln in reversed(lines):
+            head = ln.split(":", 1)[0].strip()
+            if (head.endswith(("Error", "Exception", "Warning"))
+                    or "error:" in ln or "ERROR:" in ln
+                    or (bool(head) and head.isupper())):
+                return ln[:max_len]
+        return lines[-1][:max_len]
+
+    @staticmethod
+    def new_output(path: Path, offset: int, limit: int = 24 * 1024) -> str:
+        """只读 path 里 offset 之后新增的内容 —— 这次启动子进程吐的字。
+
+        日志是**追加写**的，用字节偏移切一刀才能避开上次运行的残留；
+        否则一句陈年旧错混进失败提示，比不提示还糟。
+        """
+        try:
+            if not path.is_file():
+                return ""
+            size = path.stat().st_size
+            if size <= offset:
+                return ""
+            start = max(offset, size - limit)
+            with open(path, "rb") as fh:
+                fh.seek(start)
+                data = fh.read(size - start)
+            return data.decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            return ""
+
     # ------------------------------------------------------------ 启动
 
     def build_command(self) -> list[str]:
@@ -285,6 +355,12 @@ class GatewayManager:
 
         log_path = gateway_log()
         self._log(f"[gateway] start: {' '.join(argv)}")
+        # 记下字节偏移：从这一刻起写进日志的，才是"这次启动"子进程的输出。
+        # 失败时靠它把 traceback 捞回来给用户看（见下面那段失败分支）。
+        try:
+            start_offset = log_path.stat().st_size if log_path.is_file() else 0
+        except OSError:
+            start_offset = 0
         try:
             self._log_handle = open(log_path, "ab", buffering=0)
             self._log_handle.write(
@@ -314,13 +390,32 @@ class GatewayManager:
             self._state = STATE_RUNNING
             self._last_error = ""
             return True, "网关已启动"
-        # 起不来就看看子进程是不是已经死了
+        # 起不来就看看子进程是不是已经死了，并把它的真实死因一起捞出来
         code = self._proc.poll() if self._proc else None
         self._state = STATE_ERROR
-        hint = f"（进程退出码 {code}）" if code is not None else ""
-        self._last_error = detail + hint
-        self._log(f"[gateway] 启动后健康检查失败：{detail} {hint}")
-        return False, f"启动后未通过健康检查：{detail}{hint}"
+        # wait_healthy() 的 detail 里已经带了退出码，这里再拼一遍就成了
+        # 「（退出码 1）（进程退出码 1）」—— 用户报过这个重复。只在 detail
+        # 没提到退出码时才补。
+        hint = ""
+        if code is not None and f"退出码 {code}" not in detail:
+            hint = f"（进程退出码 {code}）"
+        self._last_error = f"{detail}{hint}"
+        self._log(f"[gateway] 启动后健康检查失败：{detail}{hint}")
+
+        child_out = self.new_output(log_path, start_offset)
+        cause = self.failure_cause(child_out)
+        advice = self.exit_code_hint(code)
+        message = f"启动后未通过健康检查：{detail}{hint}"
+        if cause:
+            message += f"\n原因：{cause}"
+        if advice:
+            message += f"\n排查：{advice}"
+        if child_out.strip():
+            message += "\n完整输出见「日志」页"
+            # 顺手把子进程那段原样写进自己的日志：以后只翻 luobobox.log 也能
+            # 看到当时子进程说了什么，不必再回头猜 gateway.log 里有什么。
+            self._log("[gateway] 子进程输出：\n" + child_out.strip()[-2000:])
+        return False, message
 
     # ------------------------------------------------------------ 停止
 

@@ -519,6 +519,85 @@ def test_ensure_ready_port(work: Path) -> None:
         srv.shutdown()
 
 
+def test_gateway_failure_message(work: Path) -> None:
+    """回归：网关子进程一起来就崩时，提示必须带上**真实死因**。
+
+    用户报过一句
+        「启动后未通过健康检查：进程提前退出（退出码 1）（进程退出码 1）」
+    —— 退出码在括号里重复了一遍，而且完全没说为什么死，照着这句话根本没法查。
+
+    实测归因（真 pythonw.exe + CREATE_NO_WINDOW，2026-09-23）：
+      · 退出码 1 = 子进程抛了未捕获异常（或自己 sys.exit(1)）
+      · 退出码 2 = argparse 参数被拒（`--port abc` 就是 2）
+      · 端口被占 / 解释器缺依赖 **都不会** 退出，会正常起来
+    也就是说「退出码 1」背后一定有一段 traceback —— 而那段 traceback 早就被
+    stdout 重定向进 gateway.log 了，这里就是保证它真的被带到用户眼前。
+    """
+    print("\n[6c] 网关起不来时，提示要带子进程的真实死因")
+    from luobobox.config import Config, pick_free_port
+    from luobobox.gateway import GatewayManager
+    from luobobox.paths import gateway_log
+
+    # ---------------------------------------------------------- 纯函数
+    check("退出码 1 → 说的是「抛了异常」", "异常" in GatewayManager.exit_code_hint(1))
+    check("退出码 2 → 说的是「参数」问题", "参数" in GatewayManager.exit_code_hint(2))
+    check("认不出的退出码不瞎猜", GatewayManager.exit_code_hint(99) == "")
+    check("None 安全返回空串", GatewayManager.exit_code_hint(None) == "")
+    check("0xC000013A（控制台被关）能识别",
+          "系统" in GatewayManager.exit_code_hint(0xC000013A))
+
+    tb = ("Traceback (most recent call last):\n"
+          '  File "converter.py", line 3, in <module>\n'
+          "    raise RuntimeError('依赖缺失')\n"
+          "RuntimeError: 依赖缺失")
+    check("从 traceback 里挑出异常收尾行",
+          GatewayManager.failure_cause(tb) == "RuntimeError: 依赖缺失")
+    check("argparse 的 error: 行也认得",
+          "invalid int" in GatewayManager.failure_cause(
+              "usage: converter.py\n"
+              "converter.py: error: argument --port: invalid int value: 'abc'"))
+    check("空输入返回空串", GatewayManager.failure_cause("") == "")
+
+    # ---------------------------------------------------------- 真跑一次
+    # 造一个「一跑就崩」的假网关目录，再让 start() 去拉它。
+    prev = os.environ.get("LUOBOBOX_DATA_DIR")
+    os.environ["LUOBOBOX_DATA_DIR"] = str(work / "failmsg")
+    try:
+        fake = work / "fake_crash_gw"
+        fake.mkdir(parents=True, exist_ok=True)
+        (fake / "converter.py").write_text(
+            "print('converter 启动中…', flush=True)\n"
+            "raise RuntimeError('模拟：依赖缺失')\n",
+            encoding="utf-8")
+
+        cfg = Config()
+        cfg.set("gateway.dir", str(fake))
+        cfg.set("gateway.python", sys.executable)
+        cfg.set("gateway.port", pick_free_port(9300))
+        cfg.set("gateway.host", "127.0.0.1")
+        cfg.set("gateway.extra_args", [])
+        gm = GatewayManager(cfg)
+        ok, msg = gm.start(wait_seconds=5)
+
+        check("崩掉的网关判为失败", ok is False)
+        check("退出码只出现一次（不再重复括号）",
+              msg.count("退出码 1") == 1 and "（进程退出码 1）" not in msg)
+        check("提示带上了子进程的异常行",
+              "RuntimeError" in msg and "依赖缺失" in msg)
+        check("提示给了排查方向", "排查：" in msg)
+        check("提示指向日志页", "「日志」页" in msg)
+        check("_last_error 保持单行（状态栏直接用）", "\n" not in gm._last_error)
+
+        text = gateway_log().read_text(encoding="utf-8", errors="replace")
+        check("gateway.log 里留有完整 traceback", "Traceback" in text)
+        check("只取本次启动的输出（字节偏移生效）",
+              text.find("Traceback") > text.rfind("[luobobox] start"))
+    finally:
+        if prev is None:
+            os.environ.pop("LUOBOBOX_DATA_DIR", None)
+        else:
+            os.environ["LUOBOBOX_DATA_DIR"] = prev
+
 
 # ============================================================ 7. Funnel
 
@@ -593,6 +672,7 @@ def main() -> int:
         test_claude(tmp)
         test_gateway_cmd(tmp)
         test_ensure_ready_port(tmp)
+        test_gateway_failure_message(tmp)
         test_funnel()
         test_real_gateway()
     finally:

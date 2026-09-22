@@ -199,9 +199,12 @@ luobobox/
 ## 测试
 
 ```bash
-# 核心逻辑自测（94 项）
+# 核心逻辑自测（110 项）
 # 注意：从 1.0.5 起这一段会 import context.py（依赖 PySide6），
 # 所以要用装了 PySide6 的解释器跑，纯系统 Python 会在 [6b] 段报 ModuleNotFoundError
+# [6c] 段专门钉住网关起不来时的提示质量：退出码 1 背后是子进程抛异常
+# （2 是 argparse 参数被拒），必须把异常收尾行带进提示、退出码不许重复两遍、
+# 且只截「这次启动」新增的日志（真拉起一个一跑就崩的假网关来验）
 python tests/selftest.py
 
 # GUI 布局 / 交互回归自测（242 项，无头可跑）
@@ -371,6 +374,8 @@ python tests/e2e_release_asset.py v1.0.3   # 校验指定 tag
 | 磁贴的 hover / active 走**动态属性**，不用 QSS 伪状态 | ① 动态属性改完**只 `update()` 底色不变**，必须 `unpolish + polish`（像素级验证过：`#2c2c2e` 不变 → `unpolish/polish` 后变 `#e06a4a`）；② `:hover` 在普通 `QWidget` 上是否会自动重绘各平台不一致，走属性就完全可控；③ 两条规则特异性相同，**`hover` 写在 `active` 前面**靠声明顺序决胜 —— 光标停在"当前页"那格上时要保持强调色 |
 | 高亮格的**文字色**另给一条 `QLabel#tileTitleOn` 规则，不用 `QWidget#tile[active="true"] QLabel#tileTitle` | 实测后者**不生效**：祖先带属性时整条后代选择器失效（把属性换成不带属性的 `QWidget#tile QLabel#tileTitle` 就正常，说明锅在属性选择器）。改成"高亮时把 objectName 换成 `tileTitleOn`"后正常，且颜色仍由 theme 生成 —— 换肤时应用级重设样式表会自动跟上，Python 侧一个色值都不写死 |
 | 磁贴的等宽等高要**自己算**，不能信 QLabel 的 `sizeHint` | 带 `wordWrap` 的 `QLabel` 的 `sizeHint` **永远按一行算**（实测：说明明明折了两行、实际占 60px 的格子，sizeHint 也是 46）—— 真正撑高行的是布局对 `heightForWidth` 的尊重。所以：撑宽用 `QFontMetrics.horizontalAdvance(整句)`（顺带消掉"末行只剩一个孤字"的折行），等高用 `heightForWidth(可用宽)` 求最大值当统一高度。这两件事都只能在 `show()` **之后**做（polish 之前字体都不对） |
+| 启动失败时必须把**子进程自己说的最后一句话**带出来，不能只报「退出码 1」 | 用户报过一句 `启动后未通过健康检查：进程提前退出（退出码 1）（进程退出码 1）`——退出码在括号里重复了两遍，而且完全没说为什么死，照着这句话无从下手。实测归因（真 `pythonw.exe` + `CREATE_NO_WINDOW`）：**退出码 1 = 子进程抛了未捕获异常**（或自己 `sys.exit(1)`），**2 = argparse 参数被拒**（`--port abc` 就是 2），而"端口被占 / 解释器缺依赖"两种坏法**都不会**退出，会正常起来。也就是说「退出码 1」背后必定有一段 traceback —— 它早就被 stdout 重定向进 `gateway.log` 了，只是以前一个字都不给用户看。现在 `start()` 失败时会把子进程的异常收尾行（`RuntimeError: xxx`）附在提示里，再给一句排查方向 + 指向「日志」页 |
+| 子进程的输出要按**字节偏移**截，不能按"最后 N 行" | `gateway.log` 是追加写的，横跨很多次启动。"最后 N 行"会把**上一次运行**的陈年旧错混进这次的失败提示，比不提示更误导。`start()` 在 `Popen` **之前**记下 `st_size`，失败时只读这之后新增的字节；同一段还会原样写进 `luobobox.log`，事后翻自己的日志就能看到当时子进程说了什么，不必再回头猜网关日志里有什么 |
 
 ---
 
