@@ -186,8 +186,26 @@ def main() -> int:
                    / f"python-{envsetup.EMBED_PY_VERSION}-embed-"
                      f"{envsetup.embed_arch()}.zip").exists())
 
-        ok3b, msg3b = envsetup.fix_python(cfg3, prefer_venv=True)
-        check("再次调用直接复用（不重复下载）", ok3b and "复用" in msg3b, msg3b)
+        # 二次调用必须**幂等且不重新下载**。
+        # 注意别断言具体文案：配置里已经是可用解释器时，fix_python 会在第 1 级
+        # （「已经配好的解释器可用 → 什么都不动」，见 envsetup.fix_python 开头）
+        # 就返回「已有可用解释器」，根本走不到 provision 那句「复用」。
+        # 真正要证明的是「不重复下载」，所以直接把下载掐断 —— 仍必须成功。
+        from luobobox import net as _net
+        _real_dl = _net.download
+        _net.download = lambda *_a, **_k: (_ for _ in ()).throw(
+            OSError("二次调用不该发起任何下载"))
+        try:
+            ok3b, msg3b = envsetup.fix_python(cfg3, prefer_venv=True)
+        finally:
+            _net.download = _real_dl
+        print(f"     二次调用：{msg3b}")
+        check("再次调用不重新下载（下载被掐断也必须成功）", ok3b, msg3b)
+        check("二次调用后解释器仍是内置那份",
+              Path(str(cfg3.get("gateway.python"))) == builtin,
+              str(cfg3.get("gateway.python")))
+        check("二次调用的说明能看出是复用/已就绪",
+              "复用" in msg3b or "已有可用解释器" in msg3b, msg3b)
     finally:
         envsetup.find_python = real_find2
         envsetup.pick_base_python = real_pick
