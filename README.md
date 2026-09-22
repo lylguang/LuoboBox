@@ -204,12 +204,14 @@ luobobox/
 # 所以要用装了 PySide6 的解释器跑，纯系统 Python 会在 [6b] 段报 ModuleNotFoundError
 python tests/selftest.py
 
-# GUI 布局 / 交互回归自测（195 项，无头可跑）
+# GUI 布局 / 交互回归自测（203 项，无头可跑）
 # 覆盖这一轮最容易悄悄坏掉的东西：页签注册表（绝不允许再出现
 # tabs.setCurrentIndex(<字面量>)）、导航分组、快捷键表与 tab_keys() 是否同步、
 # 主题引擎产出的样式表、空态、窗口几何记忆、动效降级、托盘新版本角标、
 # 一键配置环境的卡片 / 命令面板入口 / 后台日志回显、
-# 内置 Python 的落点与架构选包、配置没配好时的弹窗
+# 内置 Python 的落点与架构选包、配置没配好时的弹窗、
+# iOS 开关与分段导航（含两套调色板下的渲染）、工具栏四个按钮在
+# 五种网关状态下的可点性
 python tests/gui_layout_selftest.py
 
 # 一键配置环境 + 数据目录指针自测（144 项，离线）
@@ -348,11 +350,13 @@ python tests/e2e_release_asset.py v1.0.3   # 校验指定 tag
 | 端口占用一律问 **Windows 原生监听表**（`GetExtendedTcpTable`），不用 `connect_ex` | 本机（Windows）向 loopback 上的**空闲**端口 `connect_ex` **不会**立刻拿到 RST —— SYN 被直接丢掉，要等满超时才返回 `WSAEWOULDBLOCK(10035)`。实测 `timeout=0.6` 就是 **614.6ms/次**，而原生监听表是 **0.164ms**。UI 每刷新一轮要问 3 次「端口空不空」（`gateway.state` / `state_label` / `quick_state`），加上 `gateway.pid` → 每次拉一个 `netstat -ano` 子进程（约 228ms）—— 一轮两秒多，用户感知就是「卡」。原生表一次调用拿全表（端口 → PID），把 netstat 子进程也一起替掉 |
 | 原生监听表结果可以吃 0.25 秒短缓存，**但改配置/决定启停的判断必须 `fresh=True`** | 会**改配置**的调用点（`ensure_ready` 挪端口、`gateway.start` 预检、向导端口校验、`fix_port`）吃缓存会拿到"快照之后已经作废"的答案：实测 `ensure_ready` 吃缓存后「端口刚被占用」看不见 → 该挪的端口没挪（这一条是被自测套件抓出来的）。只读展示类调用点（状态显示 / 托盘）吃缓存换性能 |
 | 状态判定里「端口都还没监听」就**不要**发 HTTP 健康检查 | 本机向未监听端口发请求同样要等满超时（2.5s）。网关启动那几十秒里，每一次状态刷新都会被这一句卡住。先用监听表（0.164ms）判「端口起没起」，没起直接给 `STARTING`，答案一样但快一万倍。健康检查本身再叠一个 0.5s 短缓存（同一轮里 `state` 与 `state_label` 会各问一次） |
-| iOS 开关**继承** `QCheckBox` 自绘，而不是造新控件 | 全项目 16 处 `QCheckBox(...)` 创建点 + 一堆 `isChecked/setChecked/toggled` 调用点（含 195 项布局自测）。继承之后这些调用点一个字都不用改，`isinstance(w, QCheckBox)` 也继续成立；而 QSS 的 `::indicator` 只能画矩形/圆角块，做不出「圆钮在滑轨上平移」这件事 |
+| iOS 开关**继承** `QCheckBox` 自绘，而不是造新控件 | 全项目 16 处 `QCheckBox(...)` 创建点 + 一堆 `isChecked/setChecked/toggled` 调用点（含 203 项布局自测）。继承之后这些调用点一个字都不用改，`isinstance(w, QCheckBox)` 也继续成立；而 QSS 的 `::indicator` 只能画矩形/圆角块，做不出「圆钮在滑轨上平移」这件事 |
 | 自绘控件不要挂 `theme.on_change(self.update)`，改用 `changeEvent(StyleChange)` | `on_change` 的回调表只增不减，向导每开一次就多挂 7 个死控件的引用（向导是反复开关的对话框）—— 这是稳定的内存泄漏。`QApplication.setStyleSheet()` 会给所有控件派发 `StyleChange`，在那里 `update()` 既准确又不留引用 |
 | `QWidget#xxx` 要吃到 QSS 背景，必须 `setAttribute(WA_StyledBackground)` | 普通 `QWidget`（未重写 `paintEvent` 的子类）默认**不画** QSS 背景。分段控件的轨道就是一块 `QWidget`，漏了这句的表现是「轨道凭空消失、只剩几个孤立按钮」。`QFrame` 系（`Card` / `EmptyState`）没这个问题 |
 | 两套调色板的**键集合必须完全一致** | QSS 是无条件按 `pal['XXX']` 取色的。只在深色里加 `FIELD_BG`、忘了浅色，报错时机是「切到浅色」那一刻 —— 不切就永远看不见。自测里钉了这条，另外钉了「QSS 引用的每个键都真的存在」 |
 | 深/浅两套里「同一种角色」不能用同一个键 | 深色下 `BG_ALT` 与 `SURFACE` 同值（都是 `#1C1C1E`），输入框底色和卡片底色因此长得一模一样、只剩一圈描边 —— 而 iOS 表单靠「比卡片亮/暗一档」来表达内嵌。故拆出 `FIELD_BG` / `SEGMENT_TRACK` / `SEGMENT_ON`：深色下分段控件的选中片要比轨道**更亮**（`#48484A` vs `#2C2C2E`），浅色下则是白片压浅灰轨道 |
+| 按钮可点性抽成**纯函数** `_toolbar_flags(state, busy)`，不在 `_refresh_state()` 里内联 | 内联时这段逻辑只能靠"造出真网关的五种状态"才能覆盖，于是实际从来没被覆盖过，漏掉了 `external`：用户的网关多半是**外部启动**的（本机就是），`start` 原先写的是 `not (state == "running")`，于是"启动"永远是一枚亮着的高亮按钮，点下去只弹「端口被占用」。抽成纯函数后自测能把五种状态一次打完 |
+| 强调按钮（`#primary`）必须有 `:disabled` 覆盖，且禁用色 ≠ 强调色 | 否则"禁用"和"启用"长得一模一样 —— 这个 bug 之所以像"界面卡住了没刷新"，一半原因是那枚按钮看起来完全能点 |
 
 ---
 

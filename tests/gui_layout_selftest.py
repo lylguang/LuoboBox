@@ -107,7 +107,12 @@ def main() -> int:
     from luobobox.context import AppContext
     from luobobox.paths import default_gateway_dir
     from luobobox.ui import charts, motion, palette, theme
-    from luobobox.ui.main_window import TAB_PRIMARY, MainWindow, health_label
+    from luobobox.ui.main_window import (
+        TAB_PRIMARY,
+        MainWindow,
+        _toolbar_flags,
+        health_label,
+    )
     from luobobox.ui.widgets import EmptyState, IOSSwitch, StatusDot, StatusRing, Toast
 
     app.setStyleSheet(theme.stylesheet())
@@ -413,6 +418,54 @@ def main() -> int:
     check("QSS 给分段轨道配了背景色",
           bool(seg_qss) and "background-color" in seg_qss.group(1),
           seg_qss.group(1).strip()[:60] if seg_qss else "段未找到")
+
+    # ============================================================ F3 工具栏
+    section("F3. 工具栏按钮可点性（启动 / 停止 / 重启 / 管理台）")
+
+    # 这张表就是规格：端口上有没有监听者决定「启动」能不能点。
+    # `external` 是萝卜盒**最常见**的状态（用户自己先起了网关），
+    # 它曾经被漏掉 —— 于是"启动"亮着、点下去只弹「端口被占用」。
+    expect_start = {
+        "stopped": True, "starting": False, "running": False,
+        "external": False, "stopping": False,
+    }
+    bad = []
+    for st, want in expect_start.items():
+        got = _toolbar_flags(st, busy=False)["start"]
+        if got != want:
+            bad.append(f"{st}:{got}!={want}")
+    check("「启动」只在端口无人监听时可点（含 external）", not bad, bad)
+
+    check("「启动」在 runner 忙时一律不可点",
+          all(not _toolbar_flags(st, busy=True)["start"]
+              for st in expect_start))
+    check("「停止」只在跑着 / 外部接管 / 启动中可点",
+          [_toolbar_flags(st, False)["stop"]
+           for st in ("stopped", "starting", "running", "external", "stopping")]
+          == [False, True, True, True, False])
+    check("「重启」只在自家托管的 running 下可点（external 不抢）",
+          [_toolbar_flags(st, False)["restart"]
+           for st in ("stopped", "starting", "running", "external")] == [False, False, True, False])
+    check("「网页版管理台」在可连通时就可点",
+          [_toolbar_flags(st, False)["dashboard"]
+           for st in ("stopped", "running", "external")] == [False, True, True])
+
+    # 上面那张表必须真的是 win 用的那张 —— 否则测试只是自说自话。
+    real = _toolbar_flags(win.ctx.gateway.state, win.ctx.runner.busy())
+    check("窗口上的四个按钮与规格表一致",
+          [win.btn_start.isEnabled(), win.btn_stop.isEnabled(),
+           win.btn_restart.isEnabled(), win.btn_dashboard.isEnabled()]
+          == [real["start"], real["stop"], real["restart"], real["dashboard"]],
+          f"state={win.ctx.gateway.state} busy={win.ctx.runner.busy()}")
+
+    # 为什么这个 bug 会"看得见"：停用态必须真的变灰。QSS 里
+    # `#primary` 若没有 :disabled 覆盖，禁用的强调按钮会和启用时**长得一模一样**，
+    # 用户以为能点 —— 这正是当初误判"状态没刷新"的原因之一。
+    dis = re.search(r"QPushButton#primary:disabled\s*\{([^}]*)\}", theme.stylesheet())
+    check("QSS 里 #primary 有 :disabled 覆盖（禁用态会变灰）", bool(dis))
+    check("禁用强调色 ≠ 强调色（肉眼可分辨）",
+          bool(dis) and theme.DISABLED_BG != theme.ACCENT,
+          f"{theme.DISABLED_BG} vs {theme.ACCENT}")
 
     # ============================================================ G 接入包
     section("G. 一键复制接入包")

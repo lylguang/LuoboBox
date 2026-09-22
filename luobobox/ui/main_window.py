@@ -125,6 +125,31 @@ def _fmt_credits(value) -> str:
     return str(value)
 
 
+def _toolbar_flags(state: str, busy: bool) -> dict[str, bool]:
+    """工具栏四个按钮的可点状态。
+
+    ★ 抽成纯函数不是为了好看 —— 是为了让自测能把每种状态一次打完。
+      内联在 `_refresh_state()` 里时这段逻辑只能靠"造出真网关的四种状态"
+      才能覆盖，实际从来没人覆盖，于是漏掉了 external。
+
+    ★ `start` 只在**端口上没有任何监听者**时才可点。原先写的是
+      `not (state == "running")`，把 `external` 漏了：用户的网关通常是外部启动的
+      （本机就是），于是"启动"永远是一枚亮着的高亮按钮，点下去只会弹
+      「端口被占用」。高亮按钮表达的是"现在该做的那件事"，不是装饰 ——
+      已经跑起来了，该做的是"停止"。
+    """
+    running = state == "running"
+    reachable = state in ("running", "external")
+    # 端口上已经有监听者：正在运行的、外部接管的、正在启停过程中的
+    occupied = state in ("running", "external", "starting", "stopping")
+    return {
+        "start": not occupied and not busy,
+        "stop": state in ("running", "external", "starting"),
+        "restart": running,
+        "dashboard": reachable,
+    }
+
+
 def _btn(text: str, object_name: str = "", height: int = 32) -> QPushButton:
     b = QPushButton(text)
     if object_name:
@@ -1307,12 +1332,12 @@ class MainWindow(QMainWindow):
         self.f_pub.set_value(pub or "未开启")
         self.f_key.set_value(str(ctx.config.get("gateway.api_key", "")))
 
-        running = state == "running"
         reachable = state in ("running", "external")
-        self.btn_start.setEnabled(not running and not ctx.runner.busy())
-        self.btn_stop.setEnabled(state in ("running", "external", "starting"))
-        self.btn_restart.setEnabled(running)
-        self.btn_dashboard.setEnabled(reachable)
+        flags = _toolbar_flags(state, ctx.runner.busy())
+        self.btn_start.setEnabled(flags["start"])
+        self.btn_stop.setEnabled(flags["stop"])
+        self.btn_restart.setEnabled(flags["restart"])
+        self.btn_dashboard.setEnabled(flags["dashboard"])
         self.btn_add_cred.setEnabled(reachable)
         self.btn_refresh_cred.setEnabled(reachable)
 
