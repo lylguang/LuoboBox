@@ -77,7 +77,17 @@ def pointer_primary_path() -> Path:
 
 
 def pointer_legacy_path() -> Path:
-    """旧位置：出厂默认目录里的 datadir.txt（≤ v1.0.6 的行为）。"""
+    """旧位置：出厂默认目录里的 datadir.txt（≤ v1.0.6 的行为）。
+
+    `LUOBOBOX_LEGACY_POINTER_DIR` 可覆盖（测试用）。这条护栏不是多余的：
+    `pointer_legacy_path()` 指向的是**本机真实安装版正在用的指针**，而
+    `sync_pointer_home()` 的自愈会把老位置指针**搬走并删掉**。测试若只覆盖
+    `LUOBOBOX_POINTER_DIR`（只管新位置），老位置照样会落到真实路径上，
+    跑一次用例就能把用户迁移指针抹掉 —— 曾真实发生过。故两个位置都要能改道。
+    """
+    override = os.environ.get("LUOBOBOX_LEGACY_POINTER_DIR")
+    if override:
+        return Path(override) / DATA_DIR_POINTER
     return default_data_dir() / DATA_DIR_POINTER
 
 

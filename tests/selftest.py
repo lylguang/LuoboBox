@@ -136,7 +136,12 @@ def test_pointer(work: Path) -> None:
     )
 
     prev = os.environ.get("LUOBOBOX_POINTER_DIR")
+    prev_legacy = os.environ.get("LUOBOBOX_LEGACY_POINTER_DIR")
     os.environ["LUOBOBOX_POINTER_DIR"] = str(work / "pointer-home")
+    # 🔴 老位置也必须改道：pointer_legacy_path() 默认指向**本机真实安装版**
+    # 正在用的 %LOCALAPPDATA%\LuoboBox\datadir.txt，而本用例会写它、让自愈搬走它、
+    # 最后 reset 再删掉它 —— 等于跑一次用例就把用户的迁移指针抹了（曾真实发生）。
+    os.environ["LUOBOBOX_LEGACY_POINTER_DIR"] = str(work / "pointer-legacy-home")
     legacy, primary = pointer_legacy_path(), pointer_primary_path()
     try:
         # 先把现场擦干净，免得上一轮残留的指针把断言带偏
@@ -151,6 +156,10 @@ def test_pointer(work: Path) -> None:
               and Path(os.environ["LUOBOBOX_DATA_DIR"]).resolve()
               not in pointer_primary_path().resolve().parents,
               str(pointer_primary_path()))
+        check("老位置指针也改道到临时目录（不再指向本机真实指针）",
+              pointer_legacy_path() == Path(os.environ["LUOBOBOX_LEGACY_POINTER_DIR"])
+              / DATA_DIR_POINTER,
+              str(pointer_legacy_path()))
 
         target = work / "moved-data"
         target.mkdir(parents=True, exist_ok=True)
@@ -195,6 +204,10 @@ def test_pointer(work: Path) -> None:
             os.environ.pop("LUOBOBOX_POINTER_DIR", None)
         else:
             os.environ["LUOBOBOX_POINTER_DIR"] = prev
+        if prev_legacy is None:
+            os.environ.pop("LUOBOBOX_LEGACY_POINTER_DIR", None)
+        else:
+            os.environ["LUOBOBOX_LEGACY_POINTER_DIR"] = prev_legacy
 
 
 # ============================================================ 3. 脱敏补丁

@@ -30,7 +30,10 @@ TMP = Path(tempfile.mkdtemp(prefix="luobobox-envsetup-")).resolve()
 #   LUOBOBOX_DATA_DIR 让配置/备份落到临时目录；
 #   LUOBOBOX_POINTER_DIR 让「指针」落到临时目录（否则会在源码树里写一个真的
 #   datadir.txt，污染后续所有源码运行）；
-#   LOCALAPPDATA 让"老位置"也留在临时目录里（否则会碰到本机真实迁移指针）。
+#   LOCALAPPDATA 让"出厂默认目录"整体留在临时目录里 —— 这条同时管住了
+#   **老位置指针**（pointer_legacy_path() 走 default_data_dir()）。必须用
+#   LOCALAPPDATA 而不是 LUOBOBOX_LEGACY_POINTER_DIR，因为本文件后面有一条断言
+#   「老位置 = default_data_dir() 下面」，直接改道老位置变量会让它假失败。
 os.environ["LUOBOBOX_DATA_DIR"] = str(TMP / "data")
 os.environ["LUOBOBOX_POINTER_DIR"] = str(TMP / "appdir")
 os.environ["LOCALAPPDATA"] = str(TMP / "localappdata")

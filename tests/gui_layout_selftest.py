@@ -30,6 +30,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 TMP = Path(tempfile.mkdtemp(prefix="luobobox-layout-"))
 os.environ["LUOBOBOX_DATA_DIR"] = str(TMP)
+# 指针两个位置都改道：本文件会跑 envsetup.diagnose()（含 pointer 项），
+# 不改道的话它会去读**本机真实安装版**的迁移指针 —— 虽然 diagnose 只是读，
+# 但结果会随机器状态漂移（有迁移的机器上 pointer 项会变成 fix），
+# 改到临时目录后行为确定。源码模式下「程序目录旁」= 仓库根，也必须改道。
+os.environ["LUOBOBOX_POINTER_DIR"] = str(TMP / "appdir")
+os.environ["LUOBOBOX_LEGACY_POINTER_DIR"] = str(TMP / "appdir-legacy")
 
 _passed = 0
 _failed: list[str] = []

@@ -214,6 +214,11 @@ def test_paths_migration(tmp: Path) -> None:
     # 否则跑一次用例就会在源码树里留下一个真的 datadir.txt（污染后续源码运行）。
     os.environ["LUOBOBOX_POINTER_DIR"] = str(tmp / "pointer-home")
     factory = tmp / "factory"
+    # 老位置（≤v1.0.6 的出厂默认目录）也显式改道 —— 默认它指向**本机真实安装版**
+    # 正在用的 %LOCALAPPDATA%\LuoboBox\datadir.txt，本用例会写它、让自愈搬走它、
+    # 最后 reset 再删掉它。指到 factory 既安全，又保留了下面「指针不再落在
+    # 出厂目录里」这条断言的验证力（否则该断言会退化成恒真）。
+    os.environ["LUOBOBOX_LEGACY_POINTER_DIR"] = str(factory)
     # 只替换「出厂默认目录」的解析，不替换 data_dir 本身 ——
     # 别的模块是 `from .paths import data_dir` 按值绑定的，换掉 data_dir 它们看不见。
     paths.default_data_dir = lambda: factory
@@ -389,7 +394,8 @@ def test_backup_slimming(tmp: Path) -> None:
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="luobobox-net-selftest-"))
     saved_env = {k: os.environ.get(k)
-                 for k in ("LUOBOBOX_DATA_DIR", "LUOBOBOX_POINTER_DIR")}
+                 for k in ("LUOBOBOX_DATA_DIR", "LUOBOBOX_POINTER_DIR",
+                           "LUOBOBOX_LEGACY_POINTER_DIR")}
 
     from luobobox import net
 

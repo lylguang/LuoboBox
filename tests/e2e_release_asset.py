@@ -42,6 +42,9 @@ import tempfile  # noqa: E402
 _TMP = Path(tempfile.mkdtemp(prefix="luobobox-e2e-release-"))
 os.environ["LUOBOBOX_DATA_DIR"] = str(_TMP)
 os.environ["LUOBOBOX_POINTER_DIR"] = str(_TMP / "appdir")
+# 老位置也必须改道：pointer_legacy_path() 默认指向本机真实安装版的指针，
+# 而 data_dir_override() 的自愈会把它搬走并删掉。
+os.environ["LUOBOBOX_LEGACY_POINTER_DIR"] = str(_TMP / "legacy")
 
 from luobobox import appupdater as A  # noqa: E402
 from luobobox.updater import _parse_version  # noqa: E402
