@@ -636,6 +636,22 @@ def main() -> int:
           Path(envsetup.venv_dir()).parent == Path(TMP), str(envsetup.venv_dir()))
     check("没装 Python 时给出下载入口", "https://" in envsetup.python_download_hint())
 
+    # --- 傻瓜式兜底：本机一个 Python 都没有时，也要能一键装齐
+    check("内置 Python 落在数据目录下（免安装、免管理员）",
+          Path(envsetup.builtin_python_dir()).parent == Path(TMP)
+          and envsetup.BUILTIN_PY_DIR_NAME == "python",
+          str(envsetup.builtin_python_dir()))
+    check("内置 Python 先试官方源（顺序不能反）",
+          envsetup.EMBED_PY_MIRRORS[0][0] == "python.org")
+    check("内置 Python 有多镜像兜底", len(envsetup.EMBED_PY_MIRRORS) >= 2)
+    check("get-pip 引导脚本也有镜像兜底", len(envsetup.GET_PIP_MIRRORS) >= 1)
+    check("嵌入式包地址是可下载的 zip 直链",
+          all(tpl.endswith(".zip") and "{v}" in tpl for _, tpl in envsetup.EMBED_PY_MIRRORS))
+    check("内置 Python 按本机架构选包，不写死 amd64",
+          all("{arch}" in tpl for _, tpl in envsetup.EMBED_PY_MIRRORS)
+          and envsetup.embed_arch() in envsetup.EMBED_PY_ARCHES,
+          envsetup.embed_arch())
+
     # --- 设置页侧
     win.goto_tab("settings")
     check("设置页有「一键配置环境」按钮",
@@ -662,11 +678,32 @@ def main() -> int:
     check("向导「运行环境」页有一键修复按钮",
           wz.btn_env_fix.isEnabled() and "一键修复" in wz.btn_env_fix.text(),
           wz.btn_env_fix.text())
+    check("一键修复的提示说明了「没有 Python 会自动装一份内置的」",
+          "内置" in wz.btn_env_fix.toolTip(), wz.btn_env_fix.toolTip())
     check("向导用信号转发修复日志（不跨线程碰控件）",
           hasattr(wz, "env_logged"))
     wz._append_env_log("向导日志")
     check("向导日志能落到提示区",
           "向导日志" in wz.probe_out.text(), wz.probe_out.text())
+
+    # --- 弹窗：配置没配好时必须弹，而不是只往日志区写一行
+    import luobobox.ui.widgets as _widgets
+
+    _orig_popup = _widgets.message_popup
+    _captured: list = []
+    _widgets.message_popup = (
+        lambda parent, title, text, detail="", icon="warn":
+        _captured.append((title, icon, text, detail)))
+    try:
+        wz._popup_env_failed(["① 体检", "✗ 解释器与依赖：下载失败（连不上）"])
+    finally:
+        _widgets.message_popup = _orig_popup
+    check("一键修复没修好时会弹窗", len(_captured) == 1 and _captured[0][1] == "warn",
+          str(_captured[:1]))
+    check("弹窗细节里带上逐行清单",
+          "下载失败" in (_captured[0][3] if _captured else ""))
+    check("弹窗主文案给出下一步动作",
+          "重试" in (_captured[0][2] if _captured else ""))
 
     # --- 回归：窗口比内容矮时，行**不能**被压塌。
     # 用户报过「运行环境页中间区域显示异常」：Python 输入框只剩 3px、「一键修复

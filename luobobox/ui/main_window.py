@@ -1101,7 +1101,9 @@ class MainWindow(QMainWindow):
             "一键配置环境",
             "把「能跑起来」的条件一次性查清并尽量修好：数据目录指针、网关源码、"
             "解释器与依赖、端口、API Key、启动参数、脱敏补丁、内置 WebUI。"
-            "已经有值、且验证通过的项不会被覆盖。")
+            "已经有值、且验证通过的项不会被覆盖。\n"
+            "本机没有 Python 也不用管 —— 会自动下载一份内置的（免安装）；"
+            "找不到网关源码会自动从上游拉一份。")
         self.chk_env_venv = QCheckBox("缺依赖时新建独立虚拟环境（推荐：不污染系统 Python）")
         self.chk_env_venv.setChecked(True)
         self.chk_env_venv.setToolTip(
@@ -2199,17 +2201,36 @@ class MainWindow(QMainWindow):
                                   prefer_venv=prefer_venv)
 
         def done(res) -> None:
-            ok, _lines = res
+            ok, lines = res
             # 回灌表单，否则用户点一下「保存设置」就把刚修好的值覆盖回去了
             self._sync_env_widgets()
-            self._on_toast("环境已就绪，可以启动网关"
-                           if ok else "还有项目需要手动处理，见清单最后一行",
-                           "ok" if ok else "warn")
+            if ok:
+                self._on_toast("环境已就绪，可以启动网关", "ok")
+            else:
+                self._on_toast("还有项目需要手动处理，见清单最后一行", "warn")
+                # 日志会被滚走、Toast 在角落 —— 没配好必须弹窗，让用户当场看到。
+                from .widgets import message_popup
+
+                detail = "\n".join(
+                    [ln for ln in (lines or []) if str(ln).strip()][-10:])
+                message_popup(
+                    self, "环境还没配好",
+                    "一键配置环境没能把所有项都配好。\n\n"
+                    "可以再点一次重试；若提示下载失败，多半是网络或代理问题 —— "
+                    "到「设置 → 下载通道」配好代理后重试。",
+                    detail, icon="warn")
             self._refresh_state()
 
-        self.ctx.run_task(work, done,
-                          lambda m: self.env_out.appendPlainText(f"\n配置失败：{m}"),
-                          busy_text="正在配置环境…")
+        def fail(msg) -> None:
+            self.env_out.appendPlainText(f"\n配置失败：{msg}")
+            from .widgets import message_popup
+
+            message_popup(
+                self, "配置失败",
+                "配置环境时出错了，没能完成。",
+                str(msg or "").strip() or "未知错误", icon="error")
+
+        self.ctx.run_task(work, done, fail, busy_text="正在配置环境…")
 
     def _sync_env_widgets(self) -> None:
         cfg = self.ctx.config

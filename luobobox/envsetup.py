@@ -14,11 +14,18 @@
 3. **核心逻辑不依赖 Qt**。诊断、命令拼装都是纯函数，能在没有图形界面的
    环境里逐条断言 —— 否则这部分只能靠手点，等于没有回归。
 
+「傻瓜式」的底线（用户点一次，就该真的能用）：
+
+* 一个 Python 都没有时，**自动下载一份官方「嵌入式」Python 放进数据目录**。
+  它免安装、免管理员（不碰 Program Files、不要 UAC），跟着数据一起搬 / 删。
+  曾经这里只丢一个下载页链接就返回失败 —— 用户点完「一键修复」看到的仍是
+  Python 目录空空如也，等于没修。现在补齐 pip 与依赖，直接把路走完。
+* 找不到网关源码时**自动从上游仓库拉一份**（解包 → 打补丁 → 补内置 WebUI，
+  与「更新网关」复用同一条链路）。
+
 安全边界（刻意不做的事）：
 
-* 不自动下载安装 Python 本体 —— 那要 UAC，而且装错位数（32 位包）比没装更难查。
-  没有可用解释器时给出下载入口，让用户自己装一个，再点一次即可。
-* 不自动删除旧计划任务 —— 那是会跟网关抢端口的东西，但删除动作影响系统，
+* 不删旧计划任务 —— 那是会跟网关抢端口的东西，但删除动作影响系统，
   留给「设置 → 迁移与诊断」里的显式按钮。
 * 不自动启动网关 —— 配置完只报「就绪」，启动仍由用户按。
 """
@@ -26,13 +33,17 @@
 from __future__ import annotations
 
 import os
+import platform
+import shutil
 import subprocess
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import net, patcher
 from .config import DEFAULT_EXTRA_ARGS, gen_api_key, pick_free_port, port_free
 from .paths import (
+    DEFAULT_GATEWAY_DIR_NAME,
     REQUIRED_MODULES,
     data_dir,
     default_gateway_dir,
@@ -48,6 +59,38 @@ CREATE_NO_WINDOW = 0x08000000
 
 # 数据目录下的虚拟环境目录名（放在数据目录里，跟着数据一起搬、一起删）
 VENV_DIR_NAME = "pyenv"
+
+# 数据目录下的「内置 Python」目录名。用户界面上看到的那个 Python 目录就是它。
+BUILTIN_PY_DIR_NAME = "python"
+
+# 内置 Python 用的官方**嵌入式包**版本。
+#
+# 为什么是嵌入式包而不是官方安装器（.exe）：
+#   * 免安装、免管理员 —— 解压即用，不写注册表、不碰 Program Files，不要 UAC；
+#   * 体积小（约 11 MB 压缩包 / 解压后 ~50 MB），下载快；
+#   * 落在数据目录里，卸载时随数据一起删，不留残余。
+# 它唯二的短板（_pth 关掉了 site、不含 pip）由 provision_builtin_python 补齐。
+EMBED_PY_VERSION = "3.13.7"
+
+# 嵌入式包的架构后缀。**不写死 amd64** —— 装错位数就是「装完还是用不了」，
+# 与向导里那句安装包类型提示（widgets._python_arch_label）同一套判据（见 embed_arch）。
+# 三个镜像都实测提供 arm64 包（`python-3.13.7-embed-arm64.zip` 均 200），
+# 所以两种架构共用同一份候选列表，不需要为 arm64 单独裁剪。
+EMBED_PY_ARCHES = ("amd64", "arm64")
+
+# 嵌入式包的多镜像来源（模板里的 {v}/{arch} 会被替换）。先官方再国内 ——
+# 国内镜像对国内用户通常快一个数量级，而官方源在个别网络下会被掐。
+EMBED_PY_MIRRORS: tuple[tuple[str, str], ...] = (
+    ("python.org", "https://www.python.org/ftp/python/{v}/python-{v}-embed-{arch}.zip"),
+    ("华为镜像", "https://mirrors.huaweicloud.com/python/{v}/python-{v}-embed-{arch}.zip"),
+    ("阿里云镜像", "https://mirrors.aliyun.com/python-release/windows/python-{v}-embed-{arch}.zip"),
+)
+
+# pip 引导脚本（get-pip.py）。嵌入式包连 ensurepip 都没有，只能靠它装 pip。
+GET_PIP_MIRRORS: tuple[tuple[str, str], ...] = (
+    ("bootstrap.pypa.io", "https://bootstrap.pypa.io/get-pip.py"),
+    ("阿里云镜像", "https://mirrors.aliyun.com/pypi/get-pip.py"),
+)
 
 # PyPI 源：先默认源（镜像同步有延迟），失败再退国内镜像。
 # 顺序写反的话，国内用户会永远吃不到默认源的最新包。
@@ -294,6 +337,181 @@ def _last_line(text: str, limit: int = 160) -> str:
     return (lines[-1] if lines else "未知错误")[:limit]
 
 
+# ============================================================ 内置 Python
+#
+# 「这台机器上一个能用的 Python 都没有」是新手最常见、也最无从下手的死局：
+# 他并不知道要去哪里下、下哪个位数、安装时要勾什么。以前这里只丢一个下载页
+# 链接就返回失败 —— 用户点完「一键修复环境」，Python 目录还是空的。
+# 下面这几个函数把这条路走完：**自动下载一份嵌入式 Python，装齐依赖**。
+
+def embed_arch(machine: str | None = None) -> str:
+    """本机该用哪种位数的嵌入式包：``amd64`` 或 ``arm64``。
+
+    装错位数是这个流程里唯一「下完了也用不了」的死法，所以必须按本机架构选。
+
+    判据与向导的安装包类型提示同源：**环境变量优先于 ``platform.machine()``** ——
+    后者在个别精简 / 虚拟化环境里会返回空串或 ``x86``，反而是错的。
+
+    读不到或读到别的一律按 ``amd64``：它覆盖绝大多数机器；而且萝卜盒自身是
+    x64 构建，**32 位 Windows 上根本跑不起来本程序**，所以不存在「本机是 32 位
+    却拿到 64 位包」这种情况。ARM64 上 amd64 包也还能靠 x64 仿真跑。
+    """
+    sig = (machine if machine is not None
+           else (os.environ.get("PROCESSOR_ARCHITECTURE") or platform.machine() or ""))
+    return "arm64" if str(sig).strip().lower() == "arm64" else "amd64"
+
+
+def builtin_python_dir() -> Path:
+    """内置 Python 的落点：数据目录下的 ``python\\``。
+
+    放数据目录而不是程序目录，理由和 pyenv 一样 —— 跟着数据一起搬、一起删，
+    而且这个位置**不需要管理员权限**（装到 Program Files 才要 UAC）。
+    """
+    return data_dir() / BUILTIN_PY_DIR_NAME
+
+
+def builtin_python_exe() -> Path:
+    return builtin_python_dir() / "python.exe"
+
+
+def _embedded_pth(root: Path) -> Path | None:
+    """嵌入式包自带的 ``pythonXY._pth``（它就是 sys.path 的配置）。"""
+    for cand in sorted(root.glob("python*._pth")):
+        return cand
+    return None
+
+
+def patch_embedded_pth(root: Path) -> str:
+    """改写嵌入式包的 _pth，让 ``Lib\\site-packages`` 进 sys.path 并开启 site。
+
+    嵌入式的 _pth 默认 **关掉 site（``#import site`` 是注释掉的）且不含
+    site-packages** —— 不补这一步，后面 get-pip 装进去的包 import 不到，
+    表现就是「pip 说装成功了，程序却说没有这个模块」。所以这不是可选优化。
+
+    返回被改写的文件路径（便于日志与断言）。
+    """
+    pth = _embedded_pth(root)
+    if pth is None:
+        raise FileNotFoundError("没有找到 pythonXY._pth（下载的包可能不完整）")
+    raw_lines = [
+        ln.strip()
+        for ln in pth.read_text(encoding="utf-8", errors="replace").splitlines()
+    ]
+    # 只保留有用行：去空行、去注释（默认那行 "#import site" 就在这里被丢掉）。
+    useful = [ln for ln in raw_lines if ln and not ln.startswith("#")]
+    out: list[str] = [ln for ln in useful if ln.lower().endswith(".zip") or ln == "."]
+    if "." not in out:
+        out.append(".")
+    if "Lib\\site-packages" not in out:
+        out.append("Lib\\site-packages")
+    out.append("import site")
+    pth.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return str(pth)
+
+
+def _download_with_mirrors(specs, dest_dir: Path, filename: str, *, log=None,
+                           cfg_proxy: str = "") -> tuple[Path, str]:
+    """按镜像顺序下载一个文件到 ``dest_dir/filename``，第一个成功即停。
+
+    ``specs`` 是 [(说明, URL)]（URL 里的 ``{v}`` 已在调用方替换好）。
+    全失败时抛异常，消息里带最后一条失败原因 —— 上层直接贴给用户看。
+    """
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / filename
+    last = "未知错误"
+    for label, url in specs:
+        if log:
+            log(f"       下载 ← {label}")
+        try:
+            path, route = net.download(url, dest, timeout=600, cfg_proxy=cfg_proxy)
+        except Exception as exc:  # noqa: BLE001
+            last = f"{type(exc).__name__}: {str(exc)[:200]}"
+            if log:
+                log(f"       失败：{last}")
+            continue
+        return path, f"{label}（{route}）"
+    raise RuntimeError(last)
+
+
+def provision_builtin_python(*, log=None, cfg_proxy: str = "",
+                             version: str = EMBED_PY_VERSION) -> tuple[bool, str]:
+    """下载官方嵌入式 Python 到数据目录，并装齐依赖。返回 (是否成功, 说明)。
+
+    嵌入式包有两个必须补的短板，缺一不可：
+
+      1. ``pythonXY._pth`` 默认关掉 site、且不含 site-packages → 改写它；
+      2. **不含 pip（连 ensurepip 都没有）** → 用 get-pip.py 引导。
+    """
+    root = builtin_python_dir()
+    py = builtin_python_exe()
+    if py.is_file():
+        ok, _missing, _why = probe_modules(py)
+        if ok:
+            return True, f"复用已有的内置 Python：{root}"
+
+    root.mkdir(parents=True, exist_ok=True)
+    arch = embed_arch()
+    try:
+        if log:
+            log(f"       部署内置 Python {version}（{arch}，免安装、免管理员）→ {root}")
+        urls = tuple((label, tpl.format(v=version, arch=arch))
+                     for label, tpl in EMBED_PY_MIRRORS)
+        archive, via = _download_with_mirrors(
+            urls, root, f"python-{version}-embed-{arch}.zip",
+            log=log, cfg_proxy=cfg_proxy)
+        if log:
+            log(f"       解压嵌入式包（来自 {via}）")
+        with zipfile.ZipFile(archive) as zf:
+            zf.extractall(root)
+        try:
+            archive.unlink()          # 压缩包已解开，留着只是白占几十 MB
+        except OSError:
+            pass
+        patch_embedded_pth(root)
+        if not py.is_file():
+            return False, "内置 Python 解压后没有 python.exe（下载的文件可能不完整）"
+
+        # ---- pip 引导
+        bootstrap = root / "_bootstrap"
+        bootstrap.mkdir(parents=True, exist_ok=True)
+        pip_ok, last = False, "未知错误"
+        try:
+            getpip, _via2 = _download_with_mirrors(
+                GET_PIP_MIRRORS, bootstrap, "get-pip.py",
+                log=log, cfg_proxy=cfg_proxy)
+            for desc, index, proxy in install_attempts(cfg_proxy):
+                args = [str(py), str(getpip), "--no-input", "--no-cache-dir",
+                        "--disable-pip-version-check", "--no-warn-script-location"]
+                if index:
+                    args += ["--index-url", index]
+                if proxy:
+                    args += ["--proxy", proxy]
+                if log:
+                    log(f"       引导 pip ← {desc}")
+                ok, out = _run(args, timeout=600, env=pip_env())
+                if ok:
+                    pip_ok = True
+                    break
+                last = _last_line(out)
+                if log:
+                    log(f"       失败：{last}")
+        finally:
+            shutil.rmtree(bootstrap, ignore_errors=True)
+        if not pip_ok:
+            return False, f"内置 Python 已就位，但 pip 引导失败：{last}"
+
+        ok, msg = _install_deps(py, cfg_proxy=cfg_proxy, log=log)
+        if not ok:
+            return False, msg
+        good, missing, why = probe_modules(py)
+        if not good:
+            return False, f"内置 Python 依赖仍不齐：{why or '、'.join(missing)}"
+        return True, f"已部署内置 Python（免安装）：{root}"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"部署内置 Python 失败：{type(exc).__name__}: {exc}"
+
+
 # ============================================================ 诊断
 
 def _gateway_item(cfg) -> Item:
@@ -314,12 +532,13 @@ def _gateway_item(cfg) -> Item:
         return Item("gateway_dir", "网关源码", "fix",
                     f"{shown} 里没有 converter.py → 可改用 {found}",
                     "改用自动找到的网关目录")
-    return Item("gateway_dir", "网关源码", "fail",
-                "找不到 codebuddy2api（缺 converter.py）。请点「浏览」指定，"
-                "或先拉一份上游源码")
+    # 本地哪儿都没有 → 可以自动从上游仓库拉一份，所以报 fix 而不是 fail。
+    return Item("gateway_dir", "网关源码", "fix",
+                f"{shown} 里没有 converter.py，本机也没找到 codebuddy2api",
+                "自动下载一份网关源码")
 
 
-def _python_item(cfg, *, deep: bool) -> Item:
+def _python_item(cfg, *, deep: bool, can_install: bool = True) -> Item:
     raw = str(cfg.get("gateway.python") or "").strip()
     cur = Path(raw) if raw else None
 
@@ -344,6 +563,12 @@ def _python_item(cfg, *, deep: bool) -> Item:
     if base is not None:
         return Item("python", "解释器与依赖", "fix",
                     f"{base} 能跑但缺少 fastapi/uvicorn/httpx", "自动安装依赖")
+    if can_install:
+        # 一个 Python 都没有也不再是"死项" —— 会被自动下载一份内置的修好，
+        # 所以这里报 fix（可自动修）而不是 fail（要人工介入）。
+        return Item("python", "解释器与依赖", "fix",
+                    "这台机器上没有 Python → 自动下载一份内置的（免安装、免管理员）",
+                    "下载内置 Python 并装齐依赖")
     return Item("python", "解释器与依赖", "fail",
                 "这台机器上没有可用的 Python。先装一个再点一次；"
                 "装的时候记得勾「Add python.exe to PATH」")
@@ -440,12 +665,16 @@ def _scheduled_task_item() -> Item:
                 "到「迁移与诊断」里点「移除旧计划任务」")
 
 
-def diagnose(cfg, *, deep: bool = True) -> Report:
-    """体检。deep=False 时跳过子进程 / 网络探测（界面预检用，更快）。"""
+def diagnose(cfg, *, deep: bool = True, can_install: bool = True) -> Report:
+    """体检。deep=False 时跳过子进程 / 网络探测（界面预检用，更快）。
+
+    ``can_install=False`` 时「这台机器上没有 Python」判为 **fail**（要人工介入），
+    因为此时不会去下载内置解释器 —— 判成 fix 会让 setup 误报「已就绪」。
+    """
     items = [
         pointer_item(),
         _gateway_item(cfg),
-        _python_item(cfg, deep=deep),
+        _python_item(cfg, deep=deep, can_install=can_install),
         gateway_port_item(cfg, deep=deep),
     ]
 
@@ -467,10 +696,49 @@ def fix_pointer(cfg=None, **_kw) -> tuple[bool, str]:
     return True, f"指针位置正确：{pointer_primary_path()}"
 
 
-def fix_gateway_dir(cfg, **_kw) -> tuple[bool, str]:
+def fetch_gateway(cfg, *, log=None) -> tuple[bool, str]:
+    """从上游仓库拉一份网关源码到数据目录。返回 (是否成功, 说明)。
+
+    与「更新网关」复用同一条链路（下载 → 解包 → 打脱敏补丁 → 补内置 WebUI），
+    所以拿到手就是一份能直接跑的源码，不需要用户再点别的。
+    """
+    from . import updater
+
+    repo = str(cfg.get("updater.repo") or "").strip()
+    if not repo:
+        return False, "未配置上游仓库地址，无法自动获取网关源码"
+    root = data_dir() / "gateway"
+    target = root / DEFAULT_GATEWAY_DIR_NAME
+    try:
+        if log:
+            log(f"       查询上游最新版本：{repo}")
+        info = updater.check(target, repo)
+        if info.error:
+            return False, info.error
+        if not info.url_ok():
+            return False, "上游没有可下载的发行包"
+        url = info.zipball or info.tarball
+        if log:
+            log(f"       下载网关源码（{info.tag or '最新'}）")
+        archive = updater.download(url, root / "_downloads")
+        target.mkdir(parents=True, exist_ok=True)
+        res = updater.apply_release(target, archive)
+        if not res.ok:
+            return False, res.message
+    except Exception as exc:  # noqa: BLE001
+        return False, f"获取网关源码失败：{type(exc).__name__}: {exc}"
+    if not is_gateway_dir(target):
+        return False, "下载完成但没有找到 converter.py（上游包结构可能变了）"
+    cfg.set("gateway.dir", str(target))
+    cfg.set("app.last_gateway_dir", str(target))
+    return True, f"已自动获取网关源码（{info.tag or '最新'}）→ {target}"
+
+
+def fix_gateway_dir(cfg, *, log=None, **_kw) -> tuple[bool, str]:
     found = locate_gateway_dir(cfg)
     if found is None:
-        return False, "没有找到可用的 codebuddy2api 目录，需要手动指定"
+        # 本地确实没有 —— 自动拉一份，而不是把问题丢回给用户。
+        return fetch_gateway(cfg, log=log)
     cfg.set("gateway.dir", str(found))
     cfg.set("app.last_gateway_dir", str(found))
     return True, f"网关目录 → {found}"
@@ -531,6 +799,11 @@ def fix_python(cfg, *, log=None, allow_install: bool = True,
       2. 换一个现成合格的解释器 → 只改配置，不装任何东西。
       3. 建独立虚拟环境装依赖   → 推荐路径，不污染用户环境。
       4. 直接往那个解释器里装   → 3 失败时的兜底（例如磁盘上不让建 venv）。
+      5. **一个解释器都没有**   → 下载一份内置的（免安装）并装齐依赖。
+
+    第 5 级是关键：前四级都要求机器上「已经有一个能跑的 Python」。新手最常见的
+    恰恰是没有 —— 那时旧版本只返回一句「请先装一个 Python」，用户点完
+    「一键修复」看到的仍是空的 Python 目录。现在把这条路走完。
     """
     raw = str(cfg.get("gateway.python") or "").strip()
     cur = Path(raw) if raw else None
@@ -547,12 +820,20 @@ def fix_python(cfg, *, log=None, allow_install: bool = True,
     if not allow_install:
         return False, "没有现成可用的解释器（已按设置跳过自动安装）"
 
+    cfg_proxy = str(cfg.get("net.proxy", "") or "")
+
+    def use_builtin() -> tuple[bool, str]:
+        """兜底：下载一份内置 Python 并装齐依赖。"""
+        ok, msg = provision_builtin_python(log=log, cfg_proxy=cfg_proxy)
+        if ok:
+            cfg.set("gateway.python", str(builtin_python_exe()))
+        return ok, msg
+
     base = pick_base_python(cur if cur is not None and cur.is_file() else None)
     if base is None:
-        return False, ("这台机器上没有能用的 Python —— 请先从「Python 下载」"
-                       "装一个（安装时勾选 Add python.exe to PATH），再点一次")
+        # 一个能跑的解释器都没有 → 直接部署内置的。
+        return use_builtin()
 
-    cfg_proxy = str(cfg.get("net.proxy", "") or "")
     if prefer_venv:
         ok, msg = make_venv(base, log=log, cfg_proxy=cfg_proxy)
         if ok:
@@ -562,13 +843,21 @@ def fix_python(cfg, *, log=None, allow_install: bool = True,
             log(f"       （独立环境没建成，改为直接装进 {base}）")
 
     ok, msg = _install_deps(base, cfg_proxy=cfg_proxy, log=log)
-    if not ok:
-        return False, msg
-    good, missing, why = probe_modules(base)
-    if not good:
-        return False, f"依赖装完仍不可用：{why or '、'.join(missing)}"
-    cfg.set("gateway.python", str(base))
-    return True, f"已为 {base} 装好依赖"
+    if ok:
+        good, missing, why = probe_modules(base)
+        if good:
+            cfg.set("gateway.python", str(base))
+            return True, f"已为 {base} 装好依赖"
+        msg = f"依赖装完仍不可用：{why or '、'.join(missing)}"
+
+    # 最后一级兜底：现成解释器怎么都修不好（权限 / 位数 / 环境被玩坏）时，
+    # 部署一份干净的内置 Python —— 「傻瓜式」的意思就是不管机器现在什么样都别停。
+    if log:
+        log(f"       现成解释器修不好（{msg}），改为部署内置 Python")
+    okb, msgb = use_builtin()
+    if okb:
+        return True, f"{msgb}（原解释器装依赖失败：{msg}）"
+    return False, f"{msg}；内置 Python 兜底也失败：{msgb}"
 
 
 def fix_port(cfg, **_kw) -> tuple[bool, str]:
@@ -655,7 +944,7 @@ def setup(cfg, *, on_log=None, allow_install: bool = True,
                 pass  # 日志只是给人看的，绝不能因为它把配置流程带崩
 
     log("① 体检")
-    before = diagnose(cfg)
+    before = diagnose(cfg, can_install=allow_install)
     for item in before.items:
         log("   " + item.line())
 
@@ -685,7 +974,7 @@ def setup(cfg, *, on_log=None, allow_install: bool = True,
                 log(f"   ✗ 配置保存失败：{exc}")
 
     log("③ 复检")
-    after = diagnose(cfg)
+    after = diagnose(cfg, can_install=allow_install)
     for item in after.items:
         log("   " + item.line())
 

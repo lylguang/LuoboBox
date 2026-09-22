@@ -152,6 +152,73 @@ def main() -> int:
     finally:
         envsetup.find_python = real_find
 
+    # --- 场景 C：这台机器上一个能用的 Python 都没有 → 自动部署内置 Python
+    #     这是「傻瓜式」的核心承诺。以前这条支路只返回一句「请先装一个 Python」，
+    #     用户点完一键修复看到的仍是空的 Python 目录（真实用户报过）。
+    print("\n     [场景 C] 模拟「本机没有任何 Python」→ 部署内置 Python")
+    real_find2 = envsetup.find_python
+    real_pick = envsetup.pick_base_python
+    envsetup.find_python = lambda *_a, **_k: (None, [])
+    envsetup.pick_base_python = lambda *_a, **_k: None
+    t2 = time.time()
+    try:
+        cfg3 = Config()
+        cfg3.set("gateway.dir", str(gw))
+        cfg3.set("gateway.python", str(TMP / "nowhere" / "python.exe"))
+        ok3, msg3 = envsetup.fix_python(cfg3, prefer_venv=True)
+        print(f"     {msg3}（{time.time() - t2:.1f}s）")
+        builtin = envsetup.builtin_python_exe()
+        check("一个 Python 都没有时会自动部署内置 Python", ok3, msg3)
+        check("内置 Python 落在数据目录下",
+              Path(str(cfg3.get("gateway.python"))) == builtin,
+              str(cfg3.get("gateway.python")))
+        check("内置 Python 目录就是数据目录下的 python\\",
+              envsetup.builtin_python_dir() == paths.data_dir() / "python",
+              str(envsetup.builtin_python_dir()))
+        okb, missb, whyb = paths.probe_modules(builtin)
+        check("内置 Python 带齐 fastapi/uvicorn/httpx", okb, whyb or "、".join(missb))
+        pths = list(envsetup.builtin_python_dir().glob("python*._pth"))
+        pth_text = pths[0].read_text(encoding="utf-8") if pths else ""
+        check("_pth 里补上了 site-packages 并打开了 site",
+              "Lib\\site-packages" in pth_text and "import site" in pth_text, pth_text)
+        check("下载的嵌入式压缩包已清理（不留残余）",
+              not (envsetup.builtin_python_dir()
+                   / f"python-{envsetup.EMBED_PY_VERSION}-embed-"
+                     f"{envsetup.embed_arch()}.zip").exists())
+
+        ok3b, msg3b = envsetup.fix_python(cfg3, prefer_venv=True)
+        check("再次调用直接复用（不重复下载）", ok3b and "复用" in msg3b, msg3b)
+    finally:
+        envsetup.find_python = real_find2
+        envsetup.pick_base_python = real_pick
+
+    # --- 场景 D：本地找不到网关源码 → 自动从上游拉一份
+    print("\n     [场景 D] 模拟「本机没有网关源码」→ 从上游自动获取")
+    from luobobox import updater
+
+    real_locate = envsetup.locate_gateway_dir
+    envsetup.locate_gateway_dir = lambda *_a, **_k: None
+    try:
+        cfg4 = Config()
+        cfg4.set("gateway.dir", str(TMP / "nowhere"))
+        cfg4.set("app.last_gateway_dir", "")
+        ok4, msg4 = envsetup.fix_gateway_dir(cfg4)
+        print(f"     {msg4}")
+        gw4 = Path(str(cfg4.get("gateway.dir") or ""))
+        if not ok4:
+            # 上游不可达（离线 / 被墙）不该让这套 e2e 变红 —— 只提醒。
+            print(f"     ! 跳过网关自动获取的断言：{msg4}")
+        else:
+            check("上游网关源码被拉到数据目录下",
+                  gw4 == paths.data_dir() / "gateway" / "codebuddy2api", str(gw4))
+            check("拉到的目录确实是网关（有 converter.py）", (gw4 / "converter.py").is_file())
+            check("拉到的源码带了版本号", bool(updater.local_version(gw4)),
+                  updater.local_version(gw4))
+            check("拉完顺手打了脱敏补丁", patcher.inspect(gw4).healthy,
+                  patcher.inspect(gw4).summary())
+    finally:
+        envsetup.locate_gateway_dir = real_locate
+
     total = _passed + len(_failed)
     print("\n" + "=" * 64)
     print(f"通过 {_passed} / {total}")

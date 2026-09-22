@@ -323,6 +323,33 @@ def _python_arch_label() -> str:
     return "Windows ARM64" if machine == "arm64" else "Windows x86-64"
 
 
+def message_popup(parent, title: str, text: str, detail: str = "",
+                  icon: str = "warn") -> None:
+    """统一的模态弹窗。配置类流程出问题时用。
+
+    为什么必须是**弹窗**而不是 Toast / 一行日志：日志会被后续输出滚走，
+    Toast 一闪而过（error 级虽然常驻，但它在页面角落）。而「环境没配好」
+    是需要用户**当场知道、并且照着实操**的结果 —— 用户不会去翻那 190px 的
+    日志框。多行细节塞进「详细信息」里，主文案只留一句话 + 下一步动作。
+
+    icon: warn（默认）/ error / info。
+    """
+    from PySide6.QtWidgets import QMessageBox
+
+    box = QMessageBox(parent)
+    box.setIcon({
+        "warn": QMessageBox.Warning,
+        "error": QMessageBox.Critical,
+        "info": QMessageBox.Information,
+    }.get(icon, QMessageBox.Warning))
+    box.setWindowTitle(title)
+    box.setText(text)
+    if detail:
+        box.setDetailedText(detail)
+    box.setStandardButtons(QMessageBox.Ok)
+    box.exec()
+
+
 def python_download_tip() -> QWidget:
     """「没装 Python？」兜底引导：下载入口 + 装完该做什么。
 
@@ -356,6 +383,12 @@ def python_download_tip() -> QWidget:
     note.setObjectName("mute")
     note.setWordWrap(True)
     col.addWidget(note)
+
+    auto = QLabel("懒得自己装？点「一键修复环境 / 一键配置环境」，萝卜盒会"
+                  "自动下载一份内置 Python（免安装、免管理员）。")
+    auto.setObjectName("mute")
+    auto.setWordWrap(True)
+    col.addWidget(auto)
 
     pip = QLabel("已有 Python 只缺依赖：pip install fastapi uvicorn httpx")
     pip.setObjectName("mono")

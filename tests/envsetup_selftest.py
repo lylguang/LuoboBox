@@ -253,10 +253,16 @@ def main() -> int:  # noqa: PLR0915
         envsetup_mod.find_python = lambda *_a, **_k: (None, [])
         envsetup_mod.pick_base_python = lambda *_a, **_k: None
         rep = envsetup.diagnose(cfg, deep=False)
-        check("没有可用 Python → fail 并给出安装指引",
-              rep.by_key("python").state == "fail"
-              and "Add python.exe to PATH" in rep.by_key("python").detail,
+        check("没有可用 Python 时判为「可自动修」（会下载内置 Python）",
+              rep.by_key("python").state == "fix"
+              and "内置" in rep.by_key("python").detail,
               rep.by_key("python").detail)
+        check("禁止自动安装时改为 fail 并给出安装指引",
+              envsetup.diagnose(cfg, deep=False, can_install=False)
+              .by_key("python").state == "fail")
+        check("禁止安装时的提示仍含 PATH 指引",
+              "Add python.exe to PATH" in envsetup.diagnose(
+                  cfg, deep=False, can_install=False).by_key("python").detail)
 
         envsetup_mod.pick_base_python = lambda *_a, **_k: Path(sys.executable)
         rep = envsetup.diagnose(cfg, deep=False)
@@ -455,6 +461,213 @@ def main() -> int:  # noqa: PLR0915
     check("数据确实过去了", (move_dst / "marker.txt").read_text(encoding="utf-8") == "hello")
     check("迁移不把指针自己复制过去", not (move_dst / "datadir.txt").is_file())
     paths.reset_data_dir_pointer()
+
+    # ======================================================== I 内置 Python
+    section("I. 内置 Python：本机一个都没有也能一键装齐（离线替身）")
+
+    # --- 纯函数：_pth 改写（这一步做错，装进去的包会 import 不到）
+    pth_root = TMP / "pth-case"
+    pth_root.mkdir(parents=True, exist_ok=True)
+    pth = pth_root / "python313._pth"
+    pth.write_text("python313.zip\n.\n#import site\n", encoding="utf-8")
+    envsetup.patch_embedded_pth(pth_root)
+    patched = pth.read_text(encoding="utf-8")
+    plines = patched.splitlines()
+    check("_pth 补上了 site-packages", "Lib\\site-packages" in plines, patched)
+    check("_pth 打开了 site（默认那行是注释掉的）", "import site" in plines, patched)
+    check("_pth 保留了 stdlib 压缩包与当前目录",
+          "python313.zip" in plines and "." in plines, patched)
+    check("_pth 里没有残留注释行",
+          not any(ln.startswith("#") for ln in plines), patched)
+    envsetup.patch_embedded_pth(pth_root)
+    again = pth.read_text(encoding="utf-8").splitlines()
+    check("_pth 改写是幂等的（不重复追加）",
+          again.count("import site") == 1 and again.count("Lib\\site-packages") == 1,
+          str(again))
+
+    empty_root = TMP / "pth-empty"
+    empty_root.mkdir(exist_ok=True)
+    try:
+        envsetup.patch_embedded_pth(empty_root)
+        check("缺 _pth 时报错而不是装作成功", False)
+    except FileNotFoundError:
+        check("缺 _pth 时报错而不是装作成功", True)
+
+    # --- provision_builtin_python：网络 + 子进程全部换成替身（真逻辑，假 IO）
+    import shutil as _sh
+    import zipfile as _zip
+
+    from luobobox import net as net_mod
+    from luobobox.net import Route
+
+    fake_zip = TMP / "fake-embed.zip"
+    with _zip.ZipFile(fake_zip, "w") as zf:
+        zf.writestr("python313._pth", "python313.zip\n.\n#import site\n")
+        zf.writestr("python.exe", b"MZ fake")
+        zf.writestr("python313.zip", b"PK fake stdlib")
+
+    calls: list[str] = []
+    real_download = net_mod.download
+    real_run = envsetup_mod._run
+    real_probe2 = envsetup_mod.probe_modules
+
+    def fake_download(url, dest, **_kw):
+        calls.append(url)
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _sh.copy2(fake_zip, dest)
+        return dest, Route(desc="替身")
+
+    net_mod.download = fake_download
+    envsetup_mod._run = lambda argv, **_kw: (True, "ok")
+    envsetup_mod.probe_modules = lambda *_a, **_k: (True, [], "可用")
+    try:
+        logs_i: list[str] = []
+        okI, msgI = envsetup.provision_builtin_python(log=logs_i.append)
+        check("内置 Python 部署成功", okI, msgI)
+        check("落点是数据目录下的 python\\",
+              envsetup.builtin_python_dir() == paths.data_dir() / "python",
+              str(envsetup.builtin_python_dir()))
+        check("python.exe 已就位", envsetup.builtin_python_exe().is_file())
+        check("_pth 已被改写（site-packages 可见）",
+              "Lib\\site-packages" in
+              (envsetup.builtin_python_dir() / "python313._pth").read_text(encoding="utf-8"))
+        check("下载的压缩包不留残余（解开即删，stdlib 的 python313.zip 要留）",
+              not (envsetup.builtin_python_dir()
+                   / f"python-{envsetup.EMBED_PY_VERSION}-embed-{envsetup.embed_arch()}.zip")
+              .exists()
+              and (envsetup.builtin_python_dir() / "python313.zip").is_file(),
+              str([p.name for p in envsetup.builtin_python_dir().iterdir()]))
+        check("pip 引导的临时目录已清理",
+              not (envsetup.builtin_python_dir() / "_bootstrap").exists())
+        check("日志里说明了「免安装」", any("免安装" in ln for ln in logs_i), str(logs_i[:3]))
+        check("先试官方源（顺序不能反）",
+              bool(calls) and "python.org" in calls[0], str(calls[:2]))
+        check("下载地址按本机架构选包（不是写死 amd64）",
+              f"-embed-{envsetup.embed_arch()}.zip" in calls[0], str(calls[:1]))
+        check("架构识别：ARM64 → arm64", envsetup.embed_arch("ARM64") == "arm64")
+        check("架构识别：AMD64 → amd64", envsetup.embed_arch("AMD64") == "amd64")
+        check("架构识别：前后空格不敏感",
+              envsetup.embed_arch(" arm64 ") == "arm64")
+        check("架构识别：读不到时兜底 amd64（ARM64 也能 x64 仿真跑）",
+              envsetup.embed_arch("") == "amd64")
+        check("每种已声明的架构都能拼出下载地址",
+              all(f"-embed-{a}.zip" in envsetup.EMBED_PY_MIRRORS[0][1].format(v="1", arch=a)
+                  for a in envsetup.EMBED_PY_ARCHES))
+
+        before = len(calls)
+        okI2, msgI2 = envsetup.provision_builtin_python()
+        check("已有可用内置 Python 时复用、不重复下载",
+              okI2 and len(calls) == before and "复用" in msgI2, msgI2)
+
+        cfg3 = Config()
+        cfg3.set("gateway.python", str(TMP / "nowhere" / "python.exe"))
+        envsetup_mod.find_python = lambda *_a, **_k: (None, [])
+        envsetup_mod.pick_base_python = lambda *_a, **_k: None
+        okI3, msgI3 = envsetup.fix_python(cfg3, prefer_venv=True)
+        check("一个解释器都没有时 fix_python 会部署内置 Python",
+              okI3 and str(cfg3.get("gateway.python")) ==
+              str(envsetup.builtin_python_exe()), msgI3)
+
+        # 现成解释器怎么都修不好 → 最后一级兜底也必须是内置 Python（不能把用户卡死）
+        real_mv, real_id = envsetup_mod.make_venv, envsetup_mod._install_deps
+        envsetup_mod.make_venv = lambda *_a, **_k: (False, "建不了独立环境")
+        envsetup_mod._install_deps = lambda *_a, **_k: (False, "装不上依赖")
+        envsetup_mod.pick_base_python = lambda *_a, **_k: Path(sys.executable)
+        try:
+            cfg5 = Config()
+            cfg5.set("gateway.python", "")
+            okI5, msgI5 = envsetup.fix_python(cfg5, prefer_venv=True)
+        finally:
+            envsetup_mod.make_venv, envsetup_mod._install_deps = real_mv, real_id
+        check("现成解释器修不好时兜底部署内置 Python",
+              okI5 and str(cfg5.get("gateway.python")) ==
+              str(envsetup.builtin_python_exe()), msgI5)
+
+        # 下载全失败 → 必须报失败并带上最后一条原因（不能假装成功）
+        net_mod.download = lambda *_a, **_k: (_ for _ in ()).throw(
+            OSError("连不上（探活超时）"))
+        envsetup_mod.probe_modules = lambda *_a, **_k: (False, [], "文件不存在")
+        envsetup.builtin_python_exe().unlink()
+        okI4, msgI4 = envsetup.provision_builtin_python()
+        check("所有镜像都下不动时报失败并把原因带回",
+              (not okI4) and "连不上" in msgI4, msgI4)
+    finally:
+        net_mod.download = real_download
+        envsetup_mod._run = real_run
+        envsetup_mod.probe_modules = real_probe2
+
+    # ======================================================== J 自动获取网关
+    section("J. 网关源码：本机没有时自动从上游拉一份（离线替身）")
+    real_locate = envsetup_mod.locate_gateway_dir
+    envsetup_mod.locate_gateway_dir = lambda *_a, **_k: None   # 强制「本地确实没有」
+    try:
+        cfg_probe = Config()
+        cfg_probe.set("gateway.dir", str(TMP / "nowhere"))
+        cfg_probe.set("app.last_gateway_dir", "")
+        item_j = envsetup.diagnose(cfg_probe, deep=False).by_key("gateway_dir")
+    finally:
+        envsetup_mod.locate_gateway_dir = real_locate
+    check("本地找不到网关时判为「可自动修」（不是 fail）",
+          item_j.state == "fix" and "自动下载" in item_j.fix_label,
+          f"{item_j.state} / {item_j.fix_label}")
+
+    from luobobox import updater as updater_mod
+
+    real_check = updater_mod.check
+    real_dl = updater_mod.download
+    real_apply = updater_mod.apply_release
+    gw_new = paths.data_dir() / "gateway" / "codebuddy2api"
+
+    class _Info:
+        tag = "v9.9.9"
+        error = ""
+        zipball = "https://example.invalid/zb"
+        tarball = ""
+
+        def url_ok(self):
+            return True
+
+    def fake_apply(target, _archive):
+        target = Path(target)
+        make_gateway(target)
+        (target / "VERSION").write_text("9.9.9", encoding="utf-8")
+        return updater_mod.ApplyResult(ok=True, message="已覆盖")
+
+    def _cfg_absent(repo: str) -> Config:
+        c = Config()
+        c.set("updater.repo", repo)
+        c.set("gateway.dir", str(TMP / "nowhere"))
+        c.set("app.last_gateway_dir", "")
+        return c
+
+    updater_mod.check = lambda *_a, **_k: _Info()
+    updater_mod.download = lambda *_a, **_k: TMP / "fake.tar.gz"
+    updater_mod.apply_release = fake_apply
+    envsetup_mod.locate_gateway_dir = lambda *_a, **_k: None
+    try:
+        cfgJ = _cfg_absent("someone/codebuddy2api")
+        okJ, msgJ = envsetup.fix_gateway_dir(cfgJ)
+        check("自动拉取网关源码成功", okJ, msgJ)
+        check("拉到了数据目录下的 gateway\\codebuddy2api",
+              cfgJ.get("gateway.dir") == str(gw_new), str(cfgJ.get("gateway.dir")))
+        check("同时记住 last_gateway_dir",
+              cfgJ.get("app.last_gateway_dir") == str(gw_new))
+        check("日志里报出上游版本", "9.9.9" in msgJ, msgJ)
+
+        okJ2, msgJ2 = envsetup.fix_gateway_dir(_cfg_absent(""))
+        check("未配置上游仓库时如实失败（不静默）",
+              (not okJ2) and "仓库" in msgJ2, msgJ2)
+
+        updater_mod.check = lambda *_a, **_k: updater_mod.ReleaseInfo(
+            error="检查更新失败：连不上 GitHub")
+        okJ3, msgJ3 = envsetup.fix_gateway_dir(_cfg_absent("someone/codebuddy2api"))
+        check("上游不可达时带回上游错误原文", (not okJ3) and "GitHub" in msgJ3, msgJ3)
+    finally:
+        updater_mod.check = real_check
+        updater_mod.download = real_dl
+        updater_mod.apply_release = real_apply
+        envsetup_mod.locate_gateway_dir = real_locate
 
     # ======================================================== 收尾
     total = _passed + len(_failed)

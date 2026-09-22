@@ -298,7 +298,8 @@ class FirstRunWizard(QDialog):
         title = QLabel("运行环境")
         title.setObjectName("h1")
         box.addWidget(title)
-        sub = QLabel("萝卜盒需要用你已有的 Python 来跑网关。点「自动探测」帮你找到带依赖的那个。")
+        sub = QLabel("萝卜盒会用你已有的 Python 来跑网关；本机一个都没有也没关系 —— "
+                     "点「一键修复环境」会自动装一份内置的（免安装、免管理员）。")
         sub.setObjectName("dim")
         sub.setWordWrap(True)
         box.addWidget(sub)
@@ -332,7 +333,8 @@ class FirstRunWizard(QDialog):
         self.btn_env_fix.setObjectName("ghost")
         self.btn_env_fix.setCursor(Qt.PointingHandCursor)
         self.btn_env_fix.setToolTip(
-            "自动定位网关目录与解释器；缺依赖时联网装包（优先建独立虚拟环境，不污染系统 Python）")
+            "自动定位网关目录与解释器（本机没有 Python 会自动下载一份内置的，"
+            "免安装、免管理员）；缺依赖时联网装包，优先建独立虚拟环境，不污染系统 Python")
         self.btn_env_fix.clicked.connect(self._env_fix)
         fix_row.addWidget(self.btn_env_fix)
         fix_note = QLabel("缺依赖要联网装包，通常几十秒。")
@@ -549,9 +551,11 @@ class FirstRunWizard(QDialog):
         self.py_dl_tip.setVisible(True)
         # 失败分两种：装了但缺依赖 vs 压根没装 —— 两者下一步动作完全不同。
         if any(why.startswith(("缺依赖", "调用失败")) for _, why in report):
-            self._warn("找到 Python 但缺少依赖，请执行 pip install fastapi uvicorn httpx 后重试。")
+            self._warn("找到 Python 但缺少依赖，点「一键修复环境」会自动装齐；"
+                       "或手动执行 pip install fastapi uvicorn httpx。")
         else:
-            self._warn("这台机器上没找到 Python，点 Python 下方的「下载安装包」链接装一个。")
+            self._warn("这台机器上没找到 Python —— 点上面「一键修复环境」"
+                       "会自动装一份内置的（免安装）；也可以从下方链接自行安装。")
 
     def _append_env_log(self, text: str) -> None:
         """工作线程 emit 的修复日志落到标签上（永远在主线程执行）。"""
@@ -581,7 +585,7 @@ class FirstRunWizard(QDialog):
                                   prefer_venv=True)
 
         def done(res) -> None:
-            ok, _ = res
+            ok, lines = res
             self._restore_fix_button()
             cfg = self.ctx.config
             self.w_dir.setText(str(cfg.get("gateway.dir") or ""))
@@ -594,12 +598,35 @@ class FirstRunWizard(QDialog):
                 self.hint.setText("环境已就绪，直接点「下一步」。")
             else:
                 self._warn("还有项目没修好，看下方清单最后一行。")
+                self._popup_env_failed(lines)
 
         def fail(msg: str) -> None:
             self._restore_fix_button()
             self._warn(f"修复失败：{(msg or '').splitlines()[0]}")
+            from .widgets import message_popup
+
+            message_popup(
+                self, "一键修复失败",
+                "环境修复过程中出错了，没能配置完成。",
+                (msg or "").strip() or "未知错误", icon="error")
 
         self.ctx.run_task(work, done, fail, busy_text="正在配置运行环境…")
+
+    def _popup_env_failed(self, lines) -> None:
+        """没修好时弹窗 —— 用户不该靠"翻日志最后一行"才知道出了什么事。
+
+        主文案只说"没修好 + 下一步动作"，逐条清单放进「详细信息」，
+        既不糊用户一脸，又保证想看细节的人看得到。
+        """
+        from .widgets import message_popup
+
+        detail = "\n".join([ln for ln in (lines or []) if str(ln).strip()][-8:])
+        message_popup(
+            self, "环境还没配好",
+            "一键修复没能把所有项都配好。\n\n"
+            "可以点「自动探测」再试一次；若提示下载失败，多半是网络或代理问题 —— "
+            "换个网络，或在「设置 → 下载通道」里配好代理后重试。",
+            detail, icon="warn")
 
     def _restore_fix_button(self) -> None:
         self.btn_env_fix.setEnabled(True)
