@@ -543,6 +543,42 @@ QPushButton#navMore:checked {{
     color: {c['TEXT']};
 }}
 
+/* ---- 「⋯ 更多」磁贴面板 = iOS action sheet 的 2 列网格版 ----
+   为什么不用 QMenu：菜单是一列纯文字，收 3 个页就占 3 行高，而且完全看不出
+   每页是干什么的。磁贴是 2 列、每格"标题 + 一句说明"，当前页再抬亮一格。
+
+   ★ QWidget#tilePanel / #tile 都是普通 QWidget，必须在 Python 侧
+     setAttribute(WA_StyledBackground)，否则 QSS 背景根本不会被画。
+   ★ hover / active 走**动态属性**，两条选择器都实测过：
+     · `QWidget#tile[active="true"] QLabel#tileTitle` **不生效** ——
+       祖先带属性时整条后代选择器会失效，所以文字色改用 objectName 切换
+       （tileTitle / tileTitleOn），颜色仍由 theme 出，换肤自动跟上；
+     · 动态属性改完只 update() 不刷新，必须 unpolish + polish。 */
+QWidget#tilePanel {{
+    background-color: {c['SURFACE']};
+    border: 1px solid {c['BORDER_HI']};
+    border-radius: 14px;
+}}
+QWidget#tile {{
+    background-color: {c['SURFACE_HI']};
+    border: 1px solid {c['BORDER']};
+    border-radius: 11px;
+}}
+/* hover 写在 active 前面：两条规则特异性相同，靠声明顺序决胜 ——
+   光标停在"当前页"那格上时应该保持强调色，而不是被 hover 抢掉。 */
+QWidget#tile[hover="true"] {{
+    background-color: {c['PRESSED']};
+    border-color: {c['BORDER_HI']};
+}}
+QWidget#tile[active="true"] {{
+    background-color: {c['ACCENT']};
+    border-color: {c['ACCENT']};
+}}
+QLabel#tileTitle {{ font-size: {p(14)}pt; font-weight: 500; }}
+QLabel#tileHint {{ color: {c['TEXT_MUTE']}; font-size: {p(12)}pt; }}
+QLabel#tileTitleOn {{ font-size: {p(14)}pt; font-weight: 500; color: {c['ACCENT_FG']}; }}
+QLabel#tileHintOn {{ color: {c['ACCENT_FG']}; font-size: {p(12)}pt; }}
+
 /* ---- 首屏英雄区 ---- */
 QLabel#heroKicker {{ color: {c['TEXT_MUTE']}; font-size: {p(12)}pt; }}
 

@@ -33,7 +33,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
-    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -48,7 +47,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import motion, theme
-from .widgets import IOSSwitch
+from .widgets import IOSSwitch, TilePanel
 from .. import __version__, appupdater, autostart, net, patcher, updater
 from ..clientconfig import snippet_claude, snippet_codex
 from ..config import gen_api_key, port_free
@@ -72,6 +71,19 @@ from ..paths import (
 # 顶部导航分组：日常最高频的四个留在外面，其余收进「⋯ 更多」。
 # 顺序即 Ctrl+1..4 的顺序。
 TAB_PRIMARY: tuple[str, ...] = ("overview", "admin", "clients", "logs")
+
+# 每页一句话说明 —— 「⋯ 更多」的磁贴用它当副标题。
+# 为什么不复用 palette.py 里那份：那里的 hint 是**搜索关键词**（拼音首字母、
+# 英文别名），给人看的是这两回事，硬塞进磁贴只会看到 "update tab 更新"。
+TAB_HINTS: dict[str, str] = {
+    "overview": "运行状态与一键启停",
+    "admin": "账号 / Key / 用量",
+    "clients": "接入包与客户端配置",
+    "logs": "网关日志与过滤",
+    "update": "两条更新链路",
+    "usage": "各账号额度消耗",
+    "settings": "端口 / 换肤 / 自启",
+}
 
 # 状态词的短版本（塞进 96px 的环里，必须够短）。
 STATE_SHORT = {
@@ -396,11 +408,23 @@ class MainWindow(QMainWindow):
         row.addWidget(self._nav_host)
         row.addStretch(1)
 
+        # 「⋯ 更多」不再挂 QMenu，改成弹一块 2 列磁贴面板（见 _toggle_more_panel）。
+        # 菜单是一列纯文字，收 3 个页就占 3 行高，而且完全看不出每页是干什么的；
+        # 磁贴每格能放"标题 + 一句说明"，还能把"当前在哪一页"直接标出来。
         self.btn_more = QPushButton("⋯ 更多")
         self.btn_more.setObjectName("navMore")
+        self.btn_more.setCheckable(True)
         self.btn_more.setCursor(Qt.PointingHandCursor)
-        self.btn_more.setToolTip("更新 / 额度消耗 / 设置")
+        self.btn_more.setToolTip("更新 / 额度消耗 / 设置（点开是磁贴面板）")
+        self.btn_more.clicked.connect(self._toggle_more_panel)
         row.addWidget(self.btn_more)
+
+        # 面板与窗口同生共死。btn_more 在 _nav_bar 里**只建一次**
+        # （_rebuild_nav 重排的是分段控件里的主入口，不动这两个按钮），
+        # 所以这里持一份引用最省心，也不会被 GC 掉。
+        self._more_panel = TilePanel(self)
+        self._more_panel.chosen.connect(self.goto_tab)
+        self._more_panel.closed.connect(self._on_more_closed)
 
         self.btn_palette = QPushButton("Ctrl+K 搜索")
         self.btn_palette.setObjectName("navMore")
@@ -434,14 +458,42 @@ class MainWindow(QMainWindow):
             self._nav_buttons[key] = btn
 
         self._overflow_keys = overflow
-        menu = QMenu(self)
-        for key in overflow:
-            act = menu.addAction(self.tab_label(key))
-            act.triggered.connect(lambda _=False, k=key: self.goto_tab(k))
-        self._nav_menu = menu          # 持引用，否则菜单会被 GC 掉
-        self.btn_more.setMenu(menu)
+        panel = getattr(self, "_more_panel", None)
+        if panel is not None:
+            # 溢出项就是磁贴的规格来源 —— 页签一增删，面板自动跟着变，
+            # 不存在"菜单里还留着已删页"这种漂移。
+            panel.set_items([(k, self.tab_label(k), self.tab_hint(k))
+                             for k in overflow])
+            if not overflow:
+                panel.hide()
         self.btn_more.setVisible(bool(overflow))
         self._nav_sync()
+
+    def tab_hint(self, key: str) -> str:
+        """这一页是干什么的一句话（磁贴副标题用；未知页返回空串）。"""
+        return TAB_HINTS.get(key, "")
+
+    def _toggle_more_panel(self) -> None:
+        """「⋯ 更多」：弹出 / 收起磁贴面板。
+
+        面板是 Qt.Popup —— 点它外面、按 Esc、选中某一格都会自己收，
+        所以这里只管"点按钮"这一个入口，不用装事件过滤器去盯外部点击。
+        """
+        panel = getattr(self, "_more_panel", None)
+        if panel is None or not panel.keys():
+            return
+        if panel.isVisible():
+            panel.hide()
+            return
+        self._nav_sync()          # 弹出前对齐高亮，别停在上一轮的那一页
+        panel.popup_under(self.btn_more)
+        self.btn_more.setChecked(True)
+
+    def _on_more_closed(self) -> None:
+        """面板收起时放掉按钮的按下态（点外面 / Esc / 选中某格都会走到）。"""
+        btn = getattr(self, "btn_more", None)
+        if btn is not None:
+            btn.setChecked(False)
 
     def _nav_sync(self) -> None:
         """同步导航高亮。收在「更多」里的页，直接把名字显示在按钮上。"""
@@ -452,6 +504,11 @@ class MainWindow(QMainWindow):
         if more is not None:
             more.setText(f"⋯ {self.tab_label(key)}" if key in self._overflow_keys
                          else "⋯ 更多")
+        # 面板里的"当前页"高亮也归这里管：颜色/命名只认 key，
+        # 跟着页签一起漂移是不可能的。
+        panel = getattr(self, "_more_panel", None)
+        if panel is not None:
+            panel.set_active(key)
 
     def _on_tab_changed(self, index: int) -> None:
         """切页时：同步导航高亮；切到「管理台」才拉数据 —— 不打扰其它页、不空转网络。"""

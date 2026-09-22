@@ -204,7 +204,7 @@ luobobox/
 # 所以要用装了 PySide6 的解释器跑，纯系统 Python 会在 [6b] 段报 ModuleNotFoundError
 python tests/selftest.py
 
-# GUI 布局 / 交互回归自测（222 项，无头可跑）
+# GUI 布局 / 交互回归自测（242 项，无头可跑）
 # 覆盖这一轮最容易悄悄坏掉的东西：页签注册表（绝不允许再出现
 # tabs.setCurrentIndex(<字面量>)）、导航分组、快捷键表与 tab_keys() 是否同步、
 # 主题引擎产出的样式表、空态、窗口几何记忆、动效降级、托盘新版本角标、
@@ -213,7 +213,9 @@ python tests/selftest.py
 # iOS 开关与分段导航（含两套调色板下的渲染）、工具栏四个按钮在
 # 五种网关状态下的可点性、网关目录定位（命令行解析 + 三级回落，禁止
 # 把"猜出来的默认值"当结果、禁止凭空捏造端口）、
-# 自动探测不阻塞主线程（丢后台 + 探测期间按住「下一步」+ 失败也放开）
+# 自动探测不阻塞主线程（丢后台 + 探测期间按住「下一步」+ 失败也放开）、
+# 「⋯ 更多」的 2 列磁贴面板（弹出/定位/Esc 收起/点格切页/当前页高亮，
+# 含"高亮底色 = 当前强调色"的像素级断言）
 python tests/gui_layout_selftest.py
 
 # 一键配置环境 + 数据目录指针自测（144 项，离线）
@@ -352,7 +354,7 @@ python tests/e2e_release_asset.py v1.0.3   # 校验指定 tag
 | 端口占用一律问 **Windows 原生监听表**（`GetExtendedTcpTable`），不用 `connect_ex` | 本机（Windows）向 loopback 上的**空闲**端口 `connect_ex` **不会**立刻拿到 RST —— SYN 被直接丢掉，要等满超时才返回 `WSAEWOULDBLOCK(10035)`。实测 `timeout=0.6` 就是 **614.6ms/次**，而原生监听表是 **0.164ms**。UI 每刷新一轮要问 3 次「端口空不空」（`gateway.state` / `state_label` / `quick_state`），加上 `gateway.pid` → 每次拉一个 `netstat -ano` 子进程（约 228ms）—— 一轮两秒多，用户感知就是「卡」。原生表一次调用拿全表（端口 → PID），把 netstat 子进程也一起替掉 |
 | 原生监听表结果可以吃 0.25 秒短缓存，**但改配置/决定启停的判断必须 `fresh=True`** | 会**改配置**的调用点（`ensure_ready` 挪端口、`gateway.start` 预检、向导端口校验、`fix_port`）吃缓存会拿到"快照之后已经作废"的答案：实测 `ensure_ready` 吃缓存后「端口刚被占用」看不见 → 该挪的端口没挪（这一条是被自测套件抓出来的）。只读展示类调用点（状态显示 / 托盘）吃缓存换性能 |
 | 状态判定里「端口都还没监听」就**不要**发 HTTP 健康检查 | 本机向未监听端口发请求同样要等满超时（2.5s）。网关启动那几十秒里，每一次状态刷新都会被这一句卡住。先用监听表（0.164ms）判「端口起没起」，没起直接给 `STARTING`，答案一样但快一万倍。健康检查本身再叠一个 0.5s 短缓存（同一轮里 `state` 与 `state_label` 会各问一次） |
-| iOS 开关**继承** `QCheckBox` 自绘，而不是造新控件 | 全项目 16 处 `QCheckBox(...)` 创建点 + 一堆 `isChecked/setChecked/toggled` 调用点（含 222 项布局自测）。继承之后这些调用点一个字都不用改，`isinstance(w, QCheckBox)` 也继续成立；而 QSS 的 `::indicator` 只能画矩形/圆角块，做不出「圆钮在滑轨上平移」这件事 |
+| iOS 开关**继承** `QCheckBox` 自绘，而不是造新控件 | 全项目 16 处 `QCheckBox(...)` 创建点 + 一堆 `isChecked/setChecked/toggled` 调用点（含 242 项布局自测）。继承之后这些调用点一个字都不用改，`isinstance(w, QCheckBox)` 也继续成立；而 QSS 的 `::indicator` 只能画矩形/圆角块，做不出「圆钮在滑轨上平移」这件事 |
 | 自绘控件不要挂 `theme.on_change(self.update)`，改用 `changeEvent(StyleChange)` | `on_change` 的回调表只增不减，向导每开一次就多挂 7 个死控件的引用（向导是反复开关的对话框）—— 这是稳定的内存泄漏。`QApplication.setStyleSheet()` 会给所有控件派发 `StyleChange`，在那里 `update()` 既准确又不留引用 |
 | `QWidget#xxx` 要吃到 QSS 背景，必须 `setAttribute(WA_StyledBackground)` | 普通 `QWidget`（未重写 `paintEvent` 的子类）默认**不画** QSS 背景。分段控件的轨道就是一块 `QWidget`，漏了这句的表现是「轨道凭空消失、只剩几个孤立按钮」。`QFrame` 系（`Card` / `EmptyState`）没这个问题 |
 | 两套调色板的**键集合必须完全一致** | QSS 是无条件按 `pal['XXX']` 取色的。只在深色里加 `FIELD_BG`、忘了浅色，报错时机是「切到浅色」那一刻 —— 不切就永远看不见。自测里钉了这条，另外钉了「QSS 引用的每个键都真的存在」 |
@@ -364,6 +366,11 @@ python tests/e2e_release_asset.py v1.0.3   # 校验指定 tag
 | 验收"路径对不对"时，把「路径不存在」和「路径存在但不是那个目录」分开说 | 老版本只有后一句。于是"向导塞了个不存在的默认值"这种情况，用户看到的是「请确认目录是否正确」，而那个目录从一开始就不该被填进去 —— 提示对了，用户才知道该怪谁 |
 | 「自动探测」整块丢后台线程，**并按住「下一步」** | 这一页一进来就探测，而里头两件事都不便宜：问运行中的网关进程要起一个 PowerShell（实测 **1537ms**）、`find_python()` 要挨个试跑候选解释器（实测 **513ms**）。同步跑就是"进入这一页窗口白掉两秒" —— 正是 1.1.0 专门修掉的那种卡，所以不能再塞回来（实测改完 `_probe()` 自身只要 **0.3ms**）。按住「下一步」不是洁癖：结果没回填就放行，校验看到的是那份**猜出来的坏值**，提示会跟事实不符；反过来说，后台失败也必须放开按钮，否则用户被永久卡在「探测中」 |
 | 探测体抽成**纯函数** `probe_environment()`，控件回填单独一个 `_apply_probe()` | 函数体里混着 `w_dir.setText()` 就没法丢线程（Qt 控件非线程安全），也没法确定性测试 —— 本机装了 Python 时，"没探到解释器"这条分支根本走不到。拆开后自测能直接调"纯函数 → 回填"这一对，线程行为另用「把 `run_task` 换成只记录不执行的替身」单独断言（连点不攒线程 / 探测中按住按钮 / 失败也放开） |
+| 右上角「⋯ 更多」改成 **2 列磁贴弹层**（`Qt.Popup`），不再用 `QMenu` | 菜单是一列纯文字，收 3 个页就占 3 行高，而且完全看不出每页干什么；磁贴每格能放"标题 + 一句说明"，还能把"当前在哪一页"标出来。选 `Qt.Popup` 而不是 `QDialog.exec()` 有两个理由：前者自带「点外面 / Esc 就收」，且**不开嵌套事件循环** —— 一个导航动作不值得。附带好处是 offscreen 下 `Qt.Popup` 也能正常 `show/hide`（实测 `isVisible()` 为真、`activePopupWidget()` 就是它），所以"面板真的弹出来了"可以被断言，不必退化成只查内部状态那种假验证 |
+| 磁贴用**普通 `QWidget` 自己接鼠标事件**，不用 `QPushButton` + 内部布局 | 实测 `QPushButton::sizeHint` 只按 text/icon 算，**完全无视子布局**：内部塞两个 `QLabel` 后按钮报 **62×20**，而布局其实要 **122×47** —— 塞进去就是"按钮塌成一条"。`QWidget` 的 sizeHint 由布局给出（122×47），尺寸天然正确 |
+| 磁贴的 hover / active 走**动态属性**，不用 QSS 伪状态 | ① 动态属性改完**只 `update()` 底色不变**，必须 `unpolish + polish`（像素级验证过：`#2c2c2e` 不变 → `unpolish/polish` 后变 `#e06a4a`）；② `:hover` 在普通 `QWidget` 上是否会自动重绘各平台不一致，走属性就完全可控；③ 两条规则特异性相同，**`hover` 写在 `active` 前面**靠声明顺序决胜 —— 光标停在"当前页"那格上时要保持强调色 |
+| 高亮格的**文字色**另给一条 `QLabel#tileTitleOn` 规则，不用 `QWidget#tile[active="true"] QLabel#tileTitle` | 实测后者**不生效**：祖先带属性时整条后代选择器失效（把属性换成不带属性的 `QWidget#tile QLabel#tileTitle` 就正常，说明锅在属性选择器）。改成"高亮时把 objectName 换成 `tileTitleOn`"后正常，且颜色仍由 theme 生成 —— 换肤时应用级重设样式表会自动跟上，Python 侧一个色值都不写死 |
+| 磁贴的等宽等高要**自己算**，不能信 QLabel 的 `sizeHint` | 带 `wordWrap` 的 `QLabel` 的 `sizeHint` **永远按一行算**（实测：说明明明折了两行、实际占 60px 的格子，sizeHint 也是 46）—— 真正撑高行的是布局对 `heightForWidth` 的尊重。所以：撑宽用 `QFontMetrics.horizontalAdvance(整句)`（顺带消掉"末行只剩一个孤字"的折行），等高用 `heightForWidth(可用宽)` 求最大值当统一高度。这两件事都只能在 `show()` **之后**做（polish 之前字体都不对） |
 
 ---
 

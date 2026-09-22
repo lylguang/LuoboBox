@@ -185,7 +185,7 @@ def main() -> int:
           win._overflow_keys)
     check("主入口能真正切页",
           all(win.goto_tab(k) and win.tab_key() == k for k in TAB_PRIMARY))
-    check("溢出页也能切（走菜单同一条通路）",
+    check("溢出页也能切（goto_tab 是唯一入口）",
           all(win.goto_tab(k) and win.tab_key() == k for k in win._overflow_keys))
     check("原生 tab bar 已隐藏", not win.tabs.tabBar().isVisible())
 
@@ -198,6 +198,102 @@ def main() -> int:
     check("主入口按钮高亮跟随当前页",
           win._nav_buttons["overview"].isChecked()
           and not win._nav_buttons["logs"].isChecked())
+
+    # ---- 「⋯ 更多」的 2 列磁贴面板（取代老的竖排 QMenu）
+    # 注意：本函数后面还有一处 `from PySide6.QtCore import Qt`，那会让 Qt 变成
+    # 整个函数的**局部名**。这里必须自己再导入一次，否则在那一行之前用 Qt 会
+    # 直接 UnboundLocalError（踩过）。
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+
+    from luobobox.ui.widgets import TilePanel
+
+    panel = win._more_panel
+    check("「更多」挂的是 TilePanel，不再有 QMenu",
+          isinstance(panel, TilePanel) and win.btn_more.menu() is None)
+    check("磁贴 key 与溢出项一一对应（顺序也一致）",
+          panel.keys() == list(win._overflow_keys),
+          f"{panel.keys()} vs {win._overflow_keys}")
+    check("每格 = 该页标题 + 一句说明",
+          all(t.title_label.text() == win.tab_label(t.key)
+              and t.hint_label.text() == win.tab_hint(t.key)
+              for t in panel.tiles()),
+          [(t.key, t.title_label.text(), t.hint_label.text()) for t in panel.tiles()])
+
+    panel.hide()
+    win.goto_tab("settings")
+    win._toggle_more_panel()
+    for _ in range(6):
+        app.processEvents()
+    check("点「更多」真的弹出面板", panel.isVisible())
+    check("弹出时按钮呈按下态", win.btn_more.isChecked())
+    check("当前所在页那格被高亮，且只有一格",
+          [t.key for t in panel.tiles() if t.is_active()] == ["settings"],
+          [t.key for t in panel.tiles() if t.is_active()])
+    btn_bottom = win.btn_more.mapToGlobal(QPoint(0, win.btn_more.height())).y()
+    btn_right = win.btn_more.mapToGlobal(QPoint(win.btn_more.width(), 0)).x()
+    check("面板贴在按钮下方、右边缘对齐",
+          panel.y() >= btn_bottom
+          and abs(panel.x() + panel.width() - btn_right) <= 2,
+          f"panel=({panel.x()},{panel.y()},{panel.width()},{panel.height()}) "
+          f"btn_bottom={btn_bottom} btn_right={btn_right}")
+
+    widths = {t.width() for t in panel.tiles()}
+    heights = sorted(t.height() for t in panel.tiles())
+    check("磁贴等宽", len(widths) == 1, widths)
+    check("磁贴等高（末行不许矮一截）", heights[-1] - heights[0] <= 1, heights)
+    # 位置要等面板真的弹出来才有值（没 show 过时所有格子都在 (0,0)）
+    check("是 2 列布局（第 2 格与第 1 格同一行、在其右侧）",
+          len(panel.tiles()) >= 3
+          and panel.tiles()[1].y() == panel.tiles()[0].y()
+          and panel.tiles()[1].x() > panel.tiles()[0].x(),
+          [(t.x(), t.y()) for t in panel.tiles()])
+
+    # 高亮是"动态属性 + unpolish/polish"换来的 —— 只 update() 底色不变
+    # （像素级验证过）。这条直接抓像素，样式一旦退回"改了属性没反应"就红。
+    t0 = panel.tiles()[0]
+    off_px = t0.grab().toImage().pixelColor(t0.width() // 2, t0.height() - 4).name()
+    t0.set_active(True)
+    for _ in range(3):
+        app.processEvents()
+    on_px = t0.grab().toImage().pixelColor(t0.width() // 2, t0.height() - 4).name()
+    want_px = theme.ACCENTS[theme.accent_name()]["color"].lower()
+    check("高亮格底色 = 当前强调色（像素级）",
+          on_px.lower() == want_px and on_px != off_px, f"{off_px} -> {on_px}")
+    t0.set_active(False)
+
+    qss = theme.stylesheet()
+    check("QSS 给面板配了背景（普通 QWidget 必须 WA_StyledBackground 才画）",
+          bool(re.search(r"QWidget#tilePanel\s*\{[^}]*background-color", qss)))
+    check("QSS 用动态属性表达 hover / active",
+          '[hover="true"]' in qss and '[active="true"]' in qss)
+    check("高亮格的文字色另给一条规则（祖先属性选择器不生效，改用 objectName）",
+          "QLabel#tileTitleOn" in qss and "QLabel#tileHintOn" in qss)
+
+    QTest.keyClick(panel, Qt.Key_Escape)
+    for _ in range(3):
+        app.processEvents()
+    check("Esc 收起面板", not panel.isVisible())
+    check("收起后按钮放掉按下态", not win.btn_more.isChecked())
+
+    win._toggle_more_panel()
+    for _ in range(4):
+        app.processEvents()
+    target = panel.tiles()[0]
+    QTest.mouseClick(target, Qt.LeftButton)
+    for _ in range(5):
+        app.processEvents()
+    check("点磁贴切到对应页", win.tab_key() == target.key, win.tab_key())
+    check("点完自动收起", not panel.isVisible())
+
+    # 磁贴是长生命周期控件：换页/换肤后高亮必须跟着走，颜色不许抠死在构造期
+    win.goto_tab("usage")
+    check("换页后高亮跑到新页",
+          [t.key for t in panel.tiles() if t.is_active()] == ["usage"],
+          [t.key for t in panel.tiles() if t.is_active()])
+    win.goto_tab("overview")
+    check("回到主入口时磁贴全部不高亮",
+          not any(t.is_active() for t in panel.tiles()))
 
     # ============================================================ C 快捷键
     section("C. 快捷键表")

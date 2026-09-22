@@ -8,6 +8,7 @@ import platform
 
 from PySide6.QtCore import (
     QEvent,
+    QPoint,
     QRectF,
     QRegularExpression,
     QSize,
@@ -18,6 +19,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QColor,
     QFont,
+    QFontMetrics,
     QPainter,
     QPainterPath,
     QPen,
@@ -28,6 +30,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -413,6 +416,260 @@ class Separator(QFrame):
         self.setObjectName("separator")
         self.setFixedHeight(1)
         self.setFrameShape(QFrame.NoFrame)
+
+
+class TileButton(QWidget):
+    """一格磁贴：标题 + 一句说明，撑满所在格子。
+
+    为什么不用 QPushButton：实测 `QPushButton` 的 sizeHint 只按 text/icon 算，
+    **完全无视子布局** —— 里面塞两个 QLabel 后按钮塌成 62×20，而布局其实要
+    122×47。所以这里用普通 QWidget 自己接鼠标事件：QWidget 的 sizeHint 由布局
+    给出，尺寸天然正确。
+
+    高亮为什么走 objectName 切换、而不是 QSS 选择器：实测
+    `QWidget#tile[active="true"] QLabel#tileTitle` **不生效**（祖先带属性时整条
+    后代选择器失效），而换成"高亮时把 objectName 改成 tileTitleOn"就正常。
+    好处是颜色仍由 theme 生成 —— 换肤时应用级重设样式表会自动跟上，
+    Python 侧一个色值都不用写死。
+
+    ★ 动态属性（hover / active）改完**必须** unpolish + polish：
+      只调 `update()` 底色不会变（像素级验证过，见 theme.py 里那段注释）。
+    """
+
+    clicked = Signal(str)
+
+    def __init__(self, key: str, title: str, hint: str = "", parent=None):
+        super().__init__(parent)
+        self.key = key
+        self.setObjectName("tile")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setProperty("hover", False)
+        self.setProperty("active", False)
+        if hint:
+            self.setToolTip(hint)
+
+        col = QVBoxLayout(self)
+        col.setContentsMargins(13, 9, 13, 10)
+        col.setSpacing(2)
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("tileTitle")
+        self.hint_label = QLabel(hint)
+        self.hint_label.setObjectName("tileHint")
+        self.hint_label.setWordWrap(True)
+        self.hint_label.setVisible(bool(hint))
+        col.addWidget(self.title_label)
+        col.addWidget(self.hint_label)
+
+    # ------------------------------------------------------------- 状态
+
+    def _restyle(self) -> None:
+        """动态属性 / objectName 变过之后，重走一遍样式解析。"""
+        for w in (self, self.title_label, self.hint_label):
+            st = w.style()
+            st.unpolish(w)
+            st.polish(w)
+            w.update()
+
+    def set_active(self, on: bool) -> None:
+        """高亮 = 这一格就是当前所在的页。"""
+        on = bool(on)
+        if bool(self.property("active")) == on:
+            return
+        self.setProperty("active", on)
+        self.title_label.setObjectName("tileTitleOn" if on else "tileTitle")
+        self.hint_label.setObjectName("tileHintOn" if on else "tileHint")
+        self._restyle()
+
+    def is_active(self) -> bool:
+        return bool(self.property("active"))
+
+    # ------------------------------------------------------------- 交互
+
+    def enterEvent(self, event) -> None:  # noqa: N802, D102
+        self.setProperty("hover", True)
+        self._restyle()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802, D102
+        self.setProperty("hover", False)
+        self._restyle()
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802, D102
+        # 松手时指针还在格子里才算点中 —— 跟按钮一个手感：按下后拖出去就取消。
+        if event.button() == Qt.LeftButton and self.rect().contains(
+                event.position().toPoint()):
+            self.clicked.emit(self.key)
+        super().mouseReleaseEvent(event)
+
+
+class TilePanel(QWidget):
+    """「⋯ 更多」的 2 列磁贴弹层。
+
+    为什么是 `Qt.Popup` 而不是 QMenu / QDialog：
+
+      · QMenu 只能一列纯文字，收 3 个页就占 3 行高，还看不出每页干什么；
+      · `Qt.Popup` 自带「点面板外面 / 按 Esc 就收」的语义，且**不阻塞事件循环**
+        —— `QDialog.exec()` 会开一个嵌套事件循环，一个导航动作不值得。
+
+    无头环境（offscreen）里 Qt.Popup 也能正常 show/hide（实测 isVisible 为真、
+    activePopupWidget 就是它），所以"面板真的弹出来了"可以被断言，
+    不必退化成只查内部状态那种假验证。
+    """
+
+    chosen = Signal(str)
+    closed = Signal()
+
+    COLUMNS = 2
+    GAP = 8
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
+        self.setObjectName("tilePanel")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(self.GAP)
+
+        self._grid = QGridLayout()
+        self._grid.setSpacing(self.GAP)
+        # 两列等宽：不设 stretch 的话列宽按各自 sizeHint 分，磁贴宽窄不一，
+        # 一眼就看得出没对齐。
+        for col in range(self.COLUMNS):
+            self._grid.setColumnStretch(col, 1)
+        outer.addLayout(self._grid)
+
+        self._tiles: dict[str, TileButton] = {}
+        self._active = ""
+
+    # ------------------------------------------------------------- 内容
+
+    def set_items(self, items: list[tuple[str, str, str]]) -> None:
+        """按 [(key, 标题, 说明)] 重建；顺序 = 从左到右、自上而下。"""
+        while self._grid.count():
+            item = self._grid.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._tiles = {}
+        for i, (key, title, hint) in enumerate(items):
+            tile = TileButton(key, title, hint)
+            tile.clicked.connect(self._on_tile)
+            self._grid.addWidget(tile, i // self.COLUMNS, i % self.COLUMNS)
+            self._tiles[key] = tile
+        self.set_active(self._active)
+
+    def keys(self) -> list[str]:
+        """按排布顺序返回 key（调用方与测试对账用）。"""
+        return list(self._tiles)
+
+    def tiles(self) -> list[TileButton]:
+        return list(self._tiles.values())
+
+    def set_active(self, key: str) -> None:
+        """高亮当前所在的页；当前页不在这几格里时，谁都不亮。"""
+        self._active = key or ""
+        for k, tile in self._tiles.items():
+            tile.set_active(k == self._active)
+
+    def _on_tile(self, key: str) -> None:
+        # 先收面板、再切页：面板的位置是按按钮算的，切页会连带重排；
+        # 不收的话它会悬在半空，看着像"没关掉"。
+        self.hide()
+        self.chosen.emit(key)
+
+    # ------------------------------------------------------------- 弹出
+
+    def popup_under(self, anchor: QWidget) -> None:
+        """贴着锚点弹出：右边缘对齐、下方留 6px，贴边时回夹进屏幕。"""
+        self.adjustSize()
+        self.move(*self._anchor_pos(anchor))   # 先粗定位，免得第一帧闪在左上角
+        self.show()
+        # ★ 下面两件事只能在 show() **之后**做：带 wordWrap 的 QLabel 在 polish
+        #   之前拿不到最终字体，尺寸全是猜的。顺序：先撑宽到"每句都排一行"，
+        #   再把格子拉齐。
+        self._fit_hints()
+        self._equalize_heights()
+        self.adjustSize()
+        self.move(*self._anchor_pos(anchor))
+        self.raise_()
+        self.setFocus(Qt.PopupFocusReason)
+
+    def _fit_hints(self) -> None:
+        """把面板撑到每句说明都能排在一行 —— 折行会吊出"只有一个字"的末行。
+
+        为什么要自己量：带 wordWrap 的 QLabel 的 sizeHint 返回的是**按启发式
+        宽度折行后**的结果，不是整句的宽度（实测同一个面板在 offscreen 与真实
+        桌面下量出来差 46px）。所以这里用 QFontMetrics 直接量整句。
+        """
+        tiles = [t for t in self._tiles.values() if t.hint_label.isVisible()]
+        if not tiles:
+            return
+        fm = QFontMetrics(tiles[0].hint_label.font())
+        need = max(fm.horizontalAdvance(t.hint_label.text()) for t in tiles)
+        # 兜个上限：万一某句特别长，也别让面板横到屏幕一半以上（那时宁可折行，
+        # 由 _equalize_heights 保证格子还是齐的）。
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            need = min(need, max(120, int(screen.availableGeometry().width() * 0.45)))
+        for t in tiles:
+            t.hint_label.setMinimumWidth(need)
+
+    def _equalize_heights(self) -> None:
+        """把所有格子拉成同高 —— 否则 2 列里单独占一行的末格会矮一截。
+
+        为什么不能直接用 `sizeHint().height()`：带 wordWrap 的 QLabel 的
+        sizeHint **永远按一行算**（实测：说明明明折了两行的格子也只报 46），
+        真正把行撑高的是布局对 `heightForWidth` 的尊重。所以这里自己按
+        "扣掉内边距后的可用宽度"算一遍，取最大值当统一高度。
+        """
+        tiles = list(self._tiles.values())
+        if not tiles:
+            return
+        need = 0
+        for t in tiles:
+            lay = t.layout()
+            m = lay.contentsMargins()
+            avail = t.width() - m.left() - m.right()
+            if avail <= 0:
+                continue
+            h = (m.top() + m.bottom() + lay.spacing()
+                 + t.title_label.sizeHint().height())
+            if t.hint_label.isVisible():
+                h += t.hint_label.heightForWidth(avail)
+            need = max(need, h)
+        for t in tiles:
+            if t.minimumHeight() < need:
+                t.setMinimumHeight(need)
+
+    def _anchor_pos(self, anchor: QWidget) -> tuple[int, int]:
+        """算面板左上角：右边缘与按钮对齐，超出屏幕就回夹。"""
+        below = anchor.mapToGlobal(QPoint(anchor.width(), anchor.height() + 6))
+        x, y = below.x() - self.width(), below.y()
+        screen = QApplication.screenAt(below) or QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            x = max(area.left() + 8, min(x, area.right() - self.width() - 7))
+            if y + self.height() > area.bottom() - 8:
+                # 下方装不下就翻到按钮上方（窗口贴着屏幕底部时的常见情形）
+                top = anchor.mapToGlobal(QPoint(0, 0)).y()
+                y = max(area.top() + 8, top - self.height() - 6)
+        return x, y
+
+    # ------------------------------------------------------------- 收场
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802, D102
+        if event.key() == Qt.Key_Escape:
+            self.hide()
+            return
+        super().keyPressEvent(event)
+
+    def hideEvent(self, event) -> None:  # noqa: N802, D102
+        self.closed.emit()
+        super().hideEvent(event)
 
 
 def link_label(text: str, url: str, color: str = theme.INFO) -> QLabel:
