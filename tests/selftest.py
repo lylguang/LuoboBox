@@ -114,6 +114,89 @@ def test_paths(work: Path) -> None:
         check("pythonw_for 容忍空路径", False, f"{type(exc).__name__}: {exc}")
 
 
+# ============================================================ 2b. 数据目录指针
+
+def test_pointer(work: Path) -> None:
+    """指针必须活得比数据目录久（≤ v1.0.6 的老位置不满足这一点）。
+
+    老版本把 datadir.txt 放在出厂默认数据目录里，于是最常见的动作
+    「腾 C 盘 → 把 LuoboBox 文件夹整个删掉」会把指针一起带走 ——
+    数据还在 D 盘，程序却回 C 盘重建一份空的。用户看到的是
+    「我的配置和备份全没了」。这一段就是防它复发。
+    """
+    print("\n[2b] 数据目录迁移指针")
+    from luobobox.paths import (
+        DATA_DIR_POINTER,
+        data_dir_override,
+        pointer_legacy_path,
+        pointer_primary_path,
+        reset_data_dir_pointer,
+        sync_pointer_home,
+        write_pointer,
+    )
+
+    prev = os.environ.get("LUOBOBOX_POINTER_DIR")
+    os.environ["LUOBOBOX_POINTER_DIR"] = str(work / "pointer-home")
+    legacy, primary = pointer_legacy_path(), pointer_primary_path()
+    try:
+        # 先把现场擦干净，免得上一轮残留的指针把断言带偏
+        for p in (primary, legacy):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+        check("指针首选位置不在数据目录里",
+              pointer_primary_path().name == DATA_DIR_POINTER
+              and Path(os.environ["LUOBOBOX_DATA_DIR"]).resolve()
+              not in pointer_primary_path().resolve().parents,
+              str(pointer_primary_path()))
+
+        target = work / "moved-data"
+        target.mkdir(parents=True, exist_ok=True)
+        landed, note = write_pointer(target)
+        check("写指针落在首选位置", landed is not None and landed == primary,
+              f"{landed} {note}")
+        check("指针内容就是目标目录",
+              primary.is_file()
+              and primary.read_text(encoding="utf-8").strip() == str(target.resolve()))
+        check("写在首选位置时不该有告警", note == "", note)
+
+        # 读取：只有"确实存在的目录"才算有效指针
+        check("能读到迁移后的数据目录",
+              data_dir_override() == target.resolve(), str(data_dir_override()))
+        primary.write_text(str(work / "根本没有这个目录"), encoding="utf-8")
+        check("指向不存在的目录视为无效指针", data_dir_override() is None)
+
+        # 自愈：老位置有、新位置没有 → 读一次就搬过来
+        primary.unlink()
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(str(target.resolve()), encoding="utf-8")
+        check("老位置指针也能被读到（升级上来的存量）",
+              data_dir_override() == target.resolve())
+        check("读到之后老指针被自动搬到新位置（自愈）",
+              primary.is_file() and not legacy.is_file(),
+              f"primary={primary.is_file()} legacy={legacy.is_file()}")
+        check("自愈完成后无事可做（幂等）",
+              sync_pointer_home() is None and primary.is_file())
+
+        # 撤销迁移：两个位置都必须清掉，否则旧指针会"复活"
+        for p in (primary, legacy):
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(str(target.resolve()), encoding="utf-8")
+        ok, msg = reset_data_dir_pointer()
+        check("撤销迁移会删掉新老两个位置的指针",
+              ok and not primary.is_file() and not legacy.is_file(), msg)
+        check("撤销后再读不到迁移目录", data_dir_override() is None)
+        ok2, msg2 = reset_data_dir_pointer()
+        check("没指针时撤销给出「本来就没事」的说明", not ok2, msg2)
+    finally:
+        if prev is None:
+            os.environ.pop("LUOBOBOX_POINTER_DIR", None)
+        else:
+            os.environ["LUOBOBOX_POINTER_DIR"] = prev
+
+
 # ============================================================ 3. 脱敏补丁
 
 def test_patcher(work: Path) -> None:
@@ -491,6 +574,7 @@ def main() -> int:
     try:
         test_config(tmp)
         test_paths(tmp)
+        test_pointer(tmp)
         test_patcher(tmp)
         test_codex(tmp)
         test_claude(tmp)

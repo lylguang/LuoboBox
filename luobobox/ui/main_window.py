@@ -12,7 +12,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
@@ -65,6 +65,8 @@ from ..paths import (
     is_on_system_drive,
     log_dir,
     migrate_data_dir,
+    pointer_legacy_path,
+    pointer_primary_path,
 )
 
 # 顶部导航分组：日常最高频的四个留在外面，其余收进「⋯ 更多」。
@@ -134,6 +136,10 @@ def _btn(text: str, object_name: str = "", height: int = 32) -> QPushButton:
 
 class MainWindow(QMainWindow):
 
+    # 一键配置环境的进度日志：配置跑在工作线程里，绝不能在那里直接碰控件。
+    # 走信号 → 自动排队回主线程（Qt 的跨线程信号是队列连接）。
+    env_logged = Signal(str)
+
     def __init__(self, ctx: AppContext):
         super().__init__()
         self.ctx = ctx
@@ -157,6 +163,9 @@ class MainWindow(QMainWindow):
         self._build()
         self._connect()
         self._bind_shortcuts()
+
+        # 一键配置环境的日志：工作线程 emit → 排在主线程执行（见 env_logged）
+        self.env_logged.connect(self._append_env_log)
 
         self.ctx.refresh_health()
         QTimer.singleShot(900, self._post_show_checks)
@@ -1057,6 +1066,17 @@ class MainWindow(QMainWindow):
         disk.add(QLabel("数据目录（配置 / 日志 / 备份 / 下载中转）："))
         disk.add(self.lbl_data_dir)
         disk.add(self.lbl_data_size)
+        # 指针必须活得比数据目录久，所以它**不在**数据目录里 ——
+        # 这一点必须让用户看得见，否则"为什么删了数据目录还能找回来"就成了巫术。
+        self.lbl_pointer = QLabel("")
+        self.lbl_pointer.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lbl_pointer.setWordWrap(True)
+        disk.add(QLabel("迁移指针（下次启动靠它去找数据目录）："))
+        disk.add(self.lbl_pointer)
+        self.lbl_pointer_warn = QLabel("")
+        self.lbl_pointer_warn.setObjectName("warnText")
+        self.lbl_pointer_warn.setWordWrap(True)
+        disk.add(self.lbl_pointer_warn)
 
         self.lbl_disk_warn = QLabel("")
         self.lbl_disk_warn.setObjectName("warnText")
@@ -1075,6 +1095,38 @@ class MainWindow(QMainWindow):
         box.addWidget(disk)
         # 体积要递归统计两万多个文件，别卡住建界面；推到事件循环里再跑。
         QTimer.singleShot(0, self._refresh_disk_info)
+
+        # ---- 一键配置环境
+        env_card = Card(
+            "一键配置环境",
+            "把「能跑起来」的条件一次性查清并尽量修好：数据目录指针、网关源码、"
+            "解释器与依赖、端口、API Key、启动参数、脱敏补丁、内置 WebUI。"
+            "已经有值、且验证通过的项不会被覆盖。")
+        self.chk_env_venv = QCheckBox("缺依赖时新建独立虚拟环境（推荐：不污染系统 Python）")
+        self.chk_env_venv.setChecked(True)
+        self.chk_env_venv.setToolTip(
+            "建在数据目录下的 pyenv\\，跟着数据一起搬、一起删。\n"
+            "不勾选则直接往现有解释器里 pip install（会影响该解释器的其它项目）。")
+        env_card.add(self.chk_env_venv)
+
+        erow = QHBoxLayout()
+        self.btn_env_setup = _btn("一键配置环境", "primary", 38)
+        self.btn_env_diag = _btn("只体检", "ghost", 38)
+        self.btn_env_plat = _btn("打开 Python 下载页", "ghost", 38)
+        erow.addWidget(self.btn_env_setup)
+        erow.addWidget(self.btn_env_diag)
+        erow.addWidget(self.btn_env_plat)
+        erow.addStretch(1)
+        env_card.add_layout(erow)
+
+        self.env_out = QPlainTextEdit()
+        self.env_out.setReadOnly(True)
+        self.env_out.setMaximumHeight(190)
+        self.env_out.setPlaceholderText("点「一键配置环境」后在这里逐行显示过程…")
+        env_card.add(self.env_out)
+        # 这一页就是为「环境不对」而来的，下载入口摆出来不算噪音。
+        env_card.add(python_download_tip())
+        box.addWidget(env_card)
 
         # ---- 迁移与诊断
         diag = Card("迁移与诊断")
@@ -1162,6 +1214,9 @@ class MainWindow(QMainWindow):
         self.btn_save.clicked.connect(self._save_settings)
         self.btn_reload.clicked.connect(self._reload_settings)
         self.btn_diag.clicked.connect(self._run_diag)
+        self.btn_env_setup.clicked.connect(self.run_env_setup)
+        self.btn_env_diag.clicked.connect(self._env_diagnose)
+        self.btn_env_plat.clicked.connect(self._open_python_download)
         self.btn_data.clicked.connect(lambda: self._open_path(data_dir()))
         self.btn_logdir.clicked.connect(lambda: self._open_path(log_dir()))
         for name in ("btn_del_task",):
@@ -2047,6 +2102,19 @@ class MainWindow(QMainWindow):
             "⚠ 数据目录在系统盘上。网关备份一份可能几百 MB，"
             "C 盘吃紧时建议迁到 D 盘 —— 备份和下载中转会一起搬走。"
             if is_on_system_drive(d) else "")
+
+        # 指针的位置必须看得见：它决定了「删掉数据目录之后程序还找不找得回来」。
+        primary, legacy = pointer_primary_path(), pointer_legacy_path()
+        if legacy.is_file() and legacy != primary and not primary.is_file():
+            self.lbl_pointer.setText(f"⚠ 还在老位置：{legacy}")
+            self.lbl_pointer_warn.setText(
+                "指针躺在出厂默认目录里 —— 用户清理 C 盘时删掉那个文件夹，指针就跟着没了，"
+                "迁移会被静默撤销（数据不会丢，但程序会回 C 盘重建一份空数据）。"
+                "点「一键配置环境」即可把它挪到程序目录旁边。")
+        else:
+            self.lbl_pointer.setText(str(primary))
+            self.lbl_pointer_warn.setText("")
+
         self.lbl_data_size.setText("正在统计体积…")
 
         def work() -> str:
@@ -2087,6 +2155,69 @@ class MainWindow(QMainWindow):
         self.ctx.run_task(lambda: migrate_data_dir(dst), done,
                           lambda m: self._on_toast(f"迁移失败：{m}", "error"),
                           busy_text="正在迁移数据目录…")
+
+    # ---------------------------------------------------------- 一键配置环境
+
+    def _open_python_download(self) -> None:
+        from ..paths import PYTHON_DOWNLOADS
+
+        QDesktopServices.openUrl(QUrl(PYTHON_DOWNLOADS[0][1]))
+
+    def _append_env_log(self, text: str) -> None:
+        """工作线程 emit 的日志落到控件上（永远在主线程执行）。"""
+        self.env_out.appendPlainText(text)
+
+    def _env_diagnose(self) -> None:
+        """只体检、不改动 —— 想先看看差在哪的时候用。"""
+        from .. import envsetup
+
+        self.env_out.setPlainText("正在体检…")
+
+        def work() -> str:
+            rep = envsetup.diagnose(self.ctx.config)
+            return f"{envsetup.summary_text(rep)}\n\n{rep.text()}\n\n{rep.todo}"
+
+        self.ctx.run_task(work, self.env_out.setPlainText,
+                          lambda m: self.env_out.setPlainText(f"体检失败：{m}"))
+
+    def run_env_setup(self) -> None:
+        """一键配置环境：体检 → 能修的当场修 → 复检，日志实时回显。
+
+        刻意不改用「体检完弹个确认框再修」：这些都是幂等且不破坏数据的动作
+        （缺什么补什么、已有的不覆盖），多一次确认只多一次犹豫。
+        真正有破坏性的动作（删旧计划任务、迁移数据目录）不在这里，各有自己的按钮。
+        """
+        from .. import envsetup
+
+        prefer_venv = self.chk_env_venv.isChecked()
+        self.env_out.clear()
+        self.env_out.setPlainText(
+            "开始一键配置环境…（缺依赖时会联网装包，通常几十秒，慢的话 1-2 分钟）")
+
+        def work():
+            return envsetup.setup(self.ctx.config, on_log=self.env_logged.emit,
+                                  prefer_venv=prefer_venv)
+
+        def done(res) -> None:
+            ok, _lines = res
+            # 回灌表单，否则用户点一下「保存设置」就把刚修好的值覆盖回去了
+            self._sync_env_widgets()
+            self._on_toast("环境已就绪，可以启动网关"
+                           if ok else "还有项目需要手动处理，见清单最后一行",
+                           "ok" if ok else "warn")
+            self._refresh_state()
+
+        self.ctx.run_task(work, done,
+                          lambda m: self.env_out.appendPlainText(f"\n配置失败：{m}"),
+                          busy_text="正在配置环境…")
+
+    def _sync_env_widgets(self) -> None:
+        cfg = self.ctx.config
+        self.in_dir.setText(str(cfg.get("gateway.dir") or ""))
+        self.in_python.setText(str(cfg.get("gateway.python") or ""))
+        self.in_port.setValue(int(cfg.get("gateway.port", 8788) or 8788))
+        self.in_key.setText(str(cfg.get("gateway.api_key") or ""))
+        self.in_args.setPlainText("\n".join(cfg.get("gateway.extra_args", []) or []))
 
     def _save_and_diagnose(self) -> None:
         """把下载通道设置写进配置，然后逐条实测。

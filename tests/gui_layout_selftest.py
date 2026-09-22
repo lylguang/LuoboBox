@@ -590,6 +590,79 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001 —— 无头环境托盘不可用时降级
         print(f"     （托盘不可用，本段降级为源码校验：{type(exc).__name__}: {exc}）")
 
+    # ============================================================ O 一键配置环境
+    section("O. 一键配置环境（体检 + 修复）")
+    from luobobox import envsetup
+
+    rep = envsetup.diagnose(cfg, deep=False)
+    ikeys = [i.key for i in rep.items]
+    check("体检清单覆盖 9 个必要项",
+          {"pointer", "gateway_dir", "python", "port", "api_key",
+           "args", "patch", "webui", "task"} <= set(ikeys), ikeys)
+    check("体检项 key 不重复", len(ikeys) == len(set(ikeys)))
+    check("每项都有图标 / 标题 / 说明",
+          all(i.glyph and i.title and i.detail for i in rep.items))
+    check("摘要写明检查项数", str(len(rep.items)) in envsetup.summary_text(rep),
+          envsetup.summary_text(rep))
+    check("counts 覆盖四种状态",
+          set(rep.counts) == {"ok", "fix", "warn", "fail"})
+    check("ready 只看 fail（可自动修的项不算失败）",
+          rep.ready == (not rep.failures), f"{rep.ready} / {len(rep.failures)}")
+    check("每个可修项都登记了修复器",
+          all(i.key in envsetup.FIXERS for i in rep.needing_fix),
+          [i.key for i in rep.needing_fix if i.key not in envsetup.FIXERS])
+    check("todo 是给人看的一句话",
+          len(rep.todo) > 4 and rep.todo.endswith("。"), rep.todo)
+
+    check("pip 命令带齐防卡参数",
+          all(f in envsetup.pip_command(Path("py.exe"))
+              for f in ("--no-input", "--no-cache-dir",
+                        "--disable-pip-version-check")))
+    check("pip 环境抹掉了继承来的代理变量",
+          not any(k in envsetup.pip_env()
+                  for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                            "http_proxy", "PIP_PROXY")))
+    attempts = envsetup.install_attempts("")
+    check("安装阶梯先默认源后国内镜像（镜像有同步延迟）",
+          attempts[0][1] == ""
+          and any("tuna" in idx for _, idx, _ in attempts), [a[0] for a in attempts])
+    check("独立环境建在数据目录下（跟着数据一起搬 / 一起删）",
+          Path(envsetup.venv_dir()).parent == Path(TMP), str(envsetup.venv_dir()))
+    check("没装 Python 时给出下载入口", "https://" in envsetup.python_download_hint())
+
+    # --- 设置页侧
+    win.goto_tab("settings")
+    check("设置页有「一键配置环境」按钮",
+          win.btn_env_setup.text().startswith("一键配置"), win.btn_env_setup.text())
+    check("设置页另有「只体检」与「打开下载页」",
+          bool(win.btn_env_diag.text()) and bool(win.btn_env_plat.text()))
+    check("缺依赖时默认走独立虚拟环境", win.chk_env_venv.isChecked())
+    check("环境输出区是只读的", win.env_out.isReadOnly())
+    check("设置页标出了指针位置", bool(win.lbl_pointer.text()), win.lbl_pointer.text())
+
+    win.env_out.clear()
+    win.env_logged.emit("第一行")      # 模拟工作线程 emit
+    win.env_logged.emit("第二行")
+    check("后台日志经信号落到输出区",
+          win.env_out.toPlainText() == "第一行\n第二行", win.env_out.toPlainText())
+
+    check("命令面板有「一键配置环境」入口",
+          "act:envsetup" in [c.key for c in palette.build_commands(win)])
+
+    # --- 向导侧
+    from luobobox.ui.wizard import FirstRunWizard
+
+    wz = FirstRunWizard(ctx)
+    check("向导「运行环境」页有一键修复按钮",
+          wz.btn_env_fix.isEnabled() and "一键修复" in wz.btn_env_fix.text(),
+          wz.btn_env_fix.text())
+    check("向导用信号转发修复日志（不跨线程碰控件）",
+          hasattr(wz, "env_logged"))
+    wz._append_env_log("向导日志")
+    check("向导日志能落到提示区",
+          "向导日志" in wz.probe_out.text(), wz.probe_out.text())
+    wz.deleteLater()
+
     # ============================================================ 收尾
     ctx.stop_timers()
     win.hide()

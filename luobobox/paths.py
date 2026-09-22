@@ -37,9 +37,6 @@ def icon_path() -> Path:
 
 # ---------------------------------------------------------------- 用户数据
 
-DATA_DIR_POINTER = "datadir.txt"
-
-
 def default_data_dir() -> Path:
     """出厂默认数据目录：%LOCALAPPDATA%\\LuoboBox（在系统盘 C: 上）。"""
     return Path(
@@ -47,23 +44,130 @@ def default_data_dir() -> Path:
     ) / APP_NAME_EN
 
 
-def data_dir_override() -> Path | None:
-    """读「数据目录迁移指针」。
+# ---------------------------------------------------------------- 迁移指针
+#
+# 指针只回答一个问题：「数据被搬到哪儿去了」。所以它**必须活得比数据目录久**。
+#
+# ≤ v1.0.6 把指针放在 `%LOCALAPPDATA%\LuoboBox` —— 而那正是出厂默认数据目录。
+# 于是最常见的动作「腾 C 盘 → 把 LuoboBox 文件夹整个删掉」会把指针一起带走，
+# 迁移被静默撤销：程序回到 C 盘重建一份空数据，用户看到的是「我的配置和
+# 备份全没了」。这不是数据被删，是**指针被删**——但用户分不出这两者的区别。
+#
+# 现在的规则：首选「程序安装目录旁边」（删数据碰不到它）。只有那里确实写不
+# 进去时（装到 Program Files 这类受控目录），才退回出厂默认目录 —— 那等于旧
+# 行为，聊胜于无，但绝不该是默认。读取时两个位置都看，并把老位置的指针
+# 顺手迁到新位置（自愈），存量安装升级上来第一次启动就自动修好。
 
-    指针文件**永远留在出厂默认目录**里 —— 这是关键：无论数据被搬到哪个盘，
-    程序下次启动都能从固定位置找回它。指针内容是一行绝对路径。
+DATA_DIR_POINTER = "datadir.txt"
+
+
+def pointer_home() -> Path:
+    """迁移指针的首选目录：程序安装目录。
+
+    `LUOBOBOX_POINTER_DIR` 可覆盖（测试用 —— 否则跑一次用例就会在源码树里
+    留下一个真的 datadir.txt，污染后续所有源码运行）。
     """
-    ptr = default_data_dir() / DATA_DIR_POINTER
+    override = os.environ.get("LUOBOBOX_POINTER_DIR")
+    return Path(override) if override else app_root()
+
+
+def pointer_primary_path() -> Path:
+    """新位置：程序安装目录旁边的 datadir.txt。"""
+    return pointer_home() / DATA_DIR_POINTER
+
+
+def pointer_legacy_path() -> Path:
+    """旧位置：出厂默认目录里的 datadir.txt（≤ v1.0.6 的行为）。"""
+    return default_data_dir() / DATA_DIR_POINTER
+
+
+def pointer_candidates() -> tuple[Path, ...]:
+    """读取顺序：新位置优先，老位置兜底。"""
+    return (pointer_primary_path(), pointer_legacy_path())
+
+
+def data_dir_pointer_path() -> Path:
+    """写入位置（迁移时用，也给 UI 显示）。"""
+    return pointer_primary_path()
+
+
+def _read_pointer(path: Path) -> Path | None:
+    """读一个指针文件；内容不是「确实存在的目录」就返回 None。"""
     try:
-        if not ptr.is_file():
+        if not path.is_file():
             return None
-        raw = ptr.read_text(encoding="utf-8-sig", errors="replace").strip()
+        raw = path.read_text(encoding="utf-8-sig", errors="replace").strip()
     except OSError:
         return None
     if not raw:
         return None
     p = Path(raw)
     return p if p.is_dir() else None
+
+
+def write_pointer(target: Path | str) -> tuple[Path | None, str]:
+    """把迁移指针写到首选位置；写不进去就退回老位置。
+
+    返回 (实际落盘路径 或 None, 说明)。两个位置都写不进去才算失败 ——
+    此时调用方必须当成「迁移未完成」处理，绝不能只打个日志了事。
+    """
+    text = str(Path(target).expanduser().resolve())
+    primary = pointer_primary_path()
+    errors: list[str] = []
+    for path in (primary, pointer_legacy_path()):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        except OSError as exc:
+            errors.append(f"{path}：{exc}")
+            continue
+        if path != primary:
+            # 退到了老位置。这个指针一删就丢，必须如实告诉用户，
+            # 别让他以为迁移已经高枕无忧了。
+            return path, (f"⚠ 指针只能写在 {path}（程序目录不可写）："
+                          "它和出厂默认目录绑在一起，删那个文件夹会让迁移失效")
+        return path, ""
+    return None, "；".join(errors) or "无法写入迁移指针"
+
+
+def sync_pointer_home() -> str | None:
+    """把老位置的指针迁到新位置（自愈）。说明性文字，无需动作时返回 None。
+
+    为什么值得每次启动都试一下：老指针会一直躺在 %LOCALAPPDATA%\\LuoboBox 里，
+    用户哪天一删文件夹就前功尽弃。成本是一次 is_file()，只有真的存在老指针时
+    才会多一次读 + 一次写。
+    """
+    primary, legacy = pointer_primary_path(), pointer_legacy_path()
+    if primary == legacy or primary.is_file() or not legacy.is_file():
+        return None
+    target = _read_pointer(legacy)
+    if target is None:
+        return None
+    landed, _note = write_pointer(target)
+    if landed != primary:
+        return None          # 新位置写不进去就先维持原样，别白删
+    try:
+        legacy.unlink()
+    except OSError:
+        pass                 # 删不掉也无妨：读取顺序里新位置优先
+    return f"数据目录指针已搬到 {landed}（旧位置不会再因删数据而失效）"
+
+
+def data_dir_override() -> Path | None:
+    """读迁移指针：返回数据被搬到的位置；没迁过返回 None。
+
+    在返回老位置的结果**之前**会尝试把它迁到新位置 —— 这是自愈点，
+    也是唯一一处「读操作带副作用」的地方，因为晚一步就可能被删掉。
+    """
+    primary = pointer_primary_path()
+    for path in pointer_candidates():
+        found = _read_pointer(path)
+        if found is None:
+            continue
+        if path != primary:
+            sync_pointer_home()
+        return found
+    return None
 
 
 def data_dir() -> Path:
@@ -109,11 +213,6 @@ def human_size(num: float) -> str:
             return f"{num:.0f} {unit}" if unit == "B" else f"{num:.1f} {unit}"
         num /= 1024
     return f"{num:.1f} TB"
-
-
-def data_dir_pointer_path() -> Path:
-    """迁移指针的固定位置（永远在出厂默认目录里）。"""
-    return default_data_dir() / DATA_DIR_POINTER
 
 
 def migrate_data_dir(target: Path | str, *, move: bool = True) -> tuple[bool, str]:
@@ -174,12 +273,9 @@ def migrate_data_dir(target: Path | str, *, move: bool = True) -> tuple[bool, st
         return False, f"复制失败（旧数据仍在 {src}，未做任何删除）：{exc}"
 
     # 写指针 —— 这一步之后程序才会去新位置
-    ptr = data_dir_pointer_path()
-    try:
-        ptr.parent.mkdir(parents=True, exist_ok=True)
-        ptr.write_text(str(dst.resolve()), encoding="utf-8")
-    except OSError as exc:
-        return False, f"写迁移指针失败（旧数据仍在 {src}）：{exc}"
+    landed, note = write_pointer(dst)
+    if landed is None:
+        return False, f"写迁移指针失败（旧数据仍在 {src}）：{note}"
 
     removed = 0
     if move:
@@ -198,20 +294,31 @@ def migrate_data_dir(target: Path | str, *, move: bool = True) -> tuple[bool, st
     msg = (f"数据目录已迁到 {dst}（复制 {copied} 项，"
            f"约 {human_size(dir_size(dst))}"
            + (f"；清理旧目录 {removed} 项" if move else "")
-           + "）。重启萝卜盒后生效。")
+           + f"）。迁移指针：{landed}。"
+           + (note or "")
+           + "重启萝卜盒后生效。")
     return True, msg
 
 
 def reset_data_dir_pointer() -> tuple[bool, str]:
-    """撤销迁移：删掉指针，让数据目录回到出厂默认位置（不搬文件）。"""
-    ptr = data_dir_pointer_path()
-    if not ptr.is_file():
+    """撤销迁移：删掉指针（新老两个位置都删），数据目录回到出厂默认位置。
+
+    只删指针、不搬文件 —— 搬回几百 MB 是个重操作，而且用户选的"撤销"
+    往往只是因为想换一个目标盘，直接覆盖写新指针即可。
+    """
+    removed: list[str] = []
+    for path in pointer_candidates():
+        if not path.is_file():
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            return False, f"删除指针失败：{path}：{exc}"
+        removed.append(str(path))
+    if not removed:
         return False, "当前没有迁移指针，数据目录本来就是出厂默认位置"
-    try:
-        ptr.unlink()
-    except OSError as exc:
-        return False, f"删除指针失败：{exc}"
-    return True, f"指针已删除，数据目录回到 {default_data_dir()}（文件没有搬回，需要手工处理）"
+    return True, ("指针已删除（" + "、".join(removed) + "），数据目录回到 "
+                  f"{default_data_dir()}（文件没有搬回，需要手工处理）")
 
 
 def config_file() -> Path:
@@ -353,12 +460,18 @@ def _candidate_interpreters() -> list[Path]:
     return out
 
 
-def _check(python: Path, modules: tuple[str, ...] = REQUIRED_MODULES) -> tuple[bool, str]:
-    """验证解释器可用且带齐依赖。返回 (是否可用, 说明)。"""
+def probe_modules(python: Path, modules: tuple[str, ...] = REQUIRED_MODULES
+                  ) -> tuple[bool, list[str], str]:
+    """探测解释器：返回 (是否可用, 缺失模块, 说明)。
+
+    为什么把「缺失模块」单独回传：两种失败的下一步动作完全不同 ——
+    缺依赖 → 装依赖就行；根本调不起来 → 得换个解释器。只回一句
+    "不可用"，上层就只能猜或者把两种情况混成一条提示。
+    """
     import subprocess
 
     if not python.exists():
-        return False, "文件不存在"
+        return False, [], "文件不存在"
     code = (
         "import importlib.util as u,sys;"
         f"miss=[m for m in {list(modules)!r} if u.find_spec(m) is None];"
@@ -372,14 +485,20 @@ def _check(python: Path, modules: tuple[str, ...] = REQUIRED_MODULES) -> tuple[b
             creationflags=0x08000000,  # CREATE_NO_WINDOW
         )
     except Exception as exc:  # noqa: BLE001
-        return False, f"调用失败：{exc}"
+        return False, [], f"调用失败：{exc}"
     if proc.returncode != 0:
         detail = (proc.stderr or "").strip().splitlines()
-        return False, detail[-1] if detail else f"退出码 {proc.returncode}"
+        return False, [], detail[-1] if detail else f"退出码 {proc.returncode}"
     missing = [m for m in (proc.stdout or "").strip().split(",") if m]
     if missing:
-        return False, "缺依赖：" + "、".join(missing)
-    return True, "可用"
+        return False, missing, "缺依赖：" + "、".join(missing)
+    return True, [], "可用"
+
+
+def _check(python: Path, modules: tuple[str, ...] = REQUIRED_MODULES) -> tuple[bool, str]:
+    """验证解释器可用且带齐依赖。返回 (是否可用, 说明)。"""
+    ok, _missing, why = probe_modules(python, modules)
+    return ok, why
 
 
 def find_python(preferred: str | None = None) -> tuple[Path | None, list[tuple[Path, str]]]:

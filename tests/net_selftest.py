@@ -210,6 +210,9 @@ def test_paths_migration(tmp: Path) -> None:
     from luobobox import paths
 
     os.environ.pop("LUOBOBOX_DATA_DIR", None)
+    # 迁移指针现在写在「程序安装目录旁边」。测试里必须改道到临时目录 ——
+    # 否则跑一次用例就会在源码树里留下一个真的 datadir.txt（污染后续源码运行）。
+    os.environ["LUOBOBOX_POINTER_DIR"] = str(tmp / "pointer-home")
     factory = tmp / "factory"
     # 只替换「出厂默认目录」的解析，不替换 data_dir 本身 ——
     # 别的模块是 `from .paths import data_dir` 按值绑定的，换掉 data_dir 它们看不见。
@@ -237,13 +240,17 @@ def test_paths_migration(tmp: Path) -> None:
     check("子目录整棵复制", (new / "backups" / "gateway-1" / "f.bin").is_file())
     check("日志已复制", (new / "logs" / "luobobox.log").is_file())
 
-    ptr = factory / paths.DATA_DIR_POINTER
-    check("指针写在出厂目录里（固定位置才找得回来）", ptr.is_file())
+    # 回归：指针**绝不能**再落在出厂默认数据目录里 ——
+    # 那样用户「腾 C 盘 → 删掉 LuoboBox 文件夹」会把指针一起带走，
+    # 迁移被静默撤销（数据还在 D 盘，程序却回 C 盘重建一份空的）。
+    ptr = paths.data_dir_pointer_path()
+    check("指针写在程序目录旁（删数据目录碰不到它）",
+          ptr.is_file() and ptr.parent != factory, str(ptr))
     check("指针内容 = 新位置绝对路径",
           ptr.read_text(encoding="utf-8").strip() == str(new.resolve()),
           ptr.read_text(encoding="utf-8").strip())
     left = sorted(p.name for p in factory.iterdir())
-    check("旧位置已清空，只剩指针", left == [paths.DATA_DIR_POINTER], str(left))
+    check("旧数据目录已清空（指针不再落在里面）", left == [], str(left))
     # 必须比 resolve()：%TEMP% 可能是 8.3 短名（C:\Users\ADMINI~1\...），
     # 而指针里存的是 resolve() 之后的长名，字符串直接比会假失败。
     check("data_dir() 现在返回新位置",
@@ -381,7 +388,8 @@ def test_backup_slimming(tmp: Path) -> None:
 
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="luobobox-net-selftest-"))
-    saved_env = {k: os.environ.get(k) for k in ("LUOBOBOX_DATA_DIR",)}
+    saved_env = {k: os.environ.get(k)
+                 for k in ("LUOBOBOX_DATA_DIR", "LUOBOBOX_POINTER_DIR")}
 
     from luobobox import net
 

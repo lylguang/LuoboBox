@@ -89,6 +89,9 @@ class FirstRunWizard(QDialog):
     """返回 True 表示用户走完了向导。"""
 
     finished_ok = Signal(bool)
+    # 一键修复的日志：工作线程 emit → 排队到主线程写控件。
+    # 不能让工作线程直接摸 probe_out，Qt 控件非线程安全。
+    env_logged = Signal(str)
 
     def __init__(self, ctx, parent=None):
         super().__init__(parent)
@@ -97,6 +100,8 @@ class FirstRunWizard(QDialog):
         if icon_path().is_file():
             self.setWindowIcon(QIcon(str(icon_path())))
         self.setMinimumSize(660, 560)
+        self._env_lines: list[str] = []
+        self.env_logged.connect(self._append_env_log)
         self._build()
         self._goto(0)
 
@@ -231,6 +236,24 @@ class FirstRunWizard(QDialog):
         pw = QWidget()
         pw.setLayout(py_row)
         form.addRow("Python", pw)
+
+        # 一键修复：把新手最容易卡住的几项（网关目录、解释器、缺失依赖、
+        # 端口、API Key、启动参数）一次补齐。等价于「设置 → 一键配置环境」，
+        # 但摆在向导里 —— 走到这一步的用户还没进过主界面。
+        fix_row = QHBoxLayout()
+        self.btn_env_fix = QPushButton("一键修复环境")
+        self.btn_env_fix.setObjectName("ghost")
+        self.btn_env_fix.setCursor(Qt.PointingHandCursor)
+        self.btn_env_fix.setToolTip(
+            "自动定位网关目录与解释器；缺依赖时联网装包（优先建独立虚拟环境，不污染系统 Python）")
+        self.btn_env_fix.clicked.connect(self._env_fix)
+        fix_row.addWidget(self.btn_env_fix)
+        fix_note = QLabel("缺依赖要联网装包，通常几十秒。")
+        fix_note.setObjectName("mute")
+        fix_row.addWidget(fix_note, 1)
+        fw = QWidget()
+        fw.setLayout(fix_row)
+        form.addRow("", fw)
 
         # 探测失败时的兜底入口：直接把下载地址摆在眼前，别让用户自己去搜。
         # 默认藏起来 —— 本机 Python 好使的用户不该被"没装 Python？"打扰，
@@ -443,6 +466,59 @@ class FirstRunWizard(QDialog):
             self._warn("找到 Python 但缺少依赖，请执行 pip install fastapi uvicorn httpx 后重试。")
         else:
             self._warn("这台机器上没找到 Python，点 Python 下方的「下载安装包」链接装一个。")
+
+    def _append_env_log(self, text: str) -> None:
+        """工作线程 emit 的修复日志落到标签上（永远在主线程执行）。"""
+        self._env_lines.append(text)
+        self.probe_out.setStyleSheet(f"color: {theme.TEXT_DIM};")
+        self.probe_out.setText("\n".join(self._env_lines[-12:]))
+
+    def _env_fix(self) -> None:
+        """一键修复环境的向导版：跑完把结果回填进表单。
+
+        回填不能省 —— `_finish()` 是拿表单里的值写配置的，
+        不把修好的值写回输入框，用户一点「完成」就全被覆盖回去了。
+        """
+        from .. import envsetup
+
+        self._env_lines = []
+        self.probe_out.setStyleSheet(f"color: {theme.TEXT_DIM};")
+        self.probe_out.setText("正在体检并补齐环境…")
+        self.btn_env_fix.setEnabled(False)
+        self.btn_env_fix.setText("正在修复…")
+        # 修完再放行「下一步」：中途跳走会带着一份半截配置进 _finish()，
+        # 那正是这个按钮要消灭的问题。
+        self.btn_next.setEnabled(False)
+
+        def work():
+            return envsetup.setup(self.ctx.config, on_log=self.env_logged.emit,
+                                  prefer_venv=True)
+
+        def done(res) -> None:
+            ok, _ = res
+            self._restore_fix_button()
+            cfg = self.ctx.config
+            self.w_dir.setText(str(cfg.get("gateway.dir") or ""))
+            self.w_py.setText(str(cfg.get("gateway.python") or ""))
+            self.w_port.setValue(int(cfg.get("gateway.port", 8788) or 8788))
+            self.w_key.setText(str(cfg.get("gateway.api_key") or ""))
+            if ok:
+                self.py_dl_tip.setVisible(False)
+                self.hint.setStyleSheet(f"color: {theme.OK};")
+                self.hint.setText("环境已就绪，直接点「下一步」。")
+            else:
+                self._warn("还有项目没修好，看下方清单最后一行。")
+
+        def fail(msg: str) -> None:
+            self._restore_fix_button()
+            self._warn(f"修复失败：{(msg or '').splitlines()[0]}")
+
+        self.ctx.run_task(work, done, fail, busy_text="正在配置运行环境…")
+
+    def _restore_fix_button(self) -> None:
+        self.btn_env_fix.setEnabled(True)
+        self.btn_env_fix.setText("一键修复环境")
+        self.btn_next.setEnabled(True)
 
     def _port_changed(self, value: int) -> None:
         if not port_free(value):

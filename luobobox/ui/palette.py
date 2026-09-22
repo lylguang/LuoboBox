@@ -136,6 +136,11 @@ def build_commands(window) -> list[Command]:
                 window._check_update),  # noqa: SLF001
         Command("act:diag", "环境体检（诊断）", "设置", "diag doctor tijian",
                 window._run_diag),  # noqa: SLF001
+        # 先切到「设置」页再动手：修复过程要往 env_out 里滚日志，
+        # 用户在别的页面上只会看到"什么也没发生"。
+        Command("act:envsetup", "一键配置环境（体检 + 修复）", "设置",
+                "env setup huanjing peizhi oneclick yijian",
+                lambda: (window.goto_tab("settings"), window.run_env_setup())),
         Command("act:logdir", "打开日志目录", "设置", "log dir rizhi",
                 lambda: window._open_path(log_dir())),  # noqa: SLF001
         Command("act:datadir", "打开数据目录", "设置", "data dir shuju",
