@@ -906,12 +906,23 @@ def main() -> int:
               f"{_got} / {_why} / {_gp}")
 
         # 向导侧：进「运行环境」页会自动探测，目录与端口都要因此被改对。
+        #
+        # ★ 探测体现在是**纯函数** probe_environment()，而 _probe() 只负责把它
+        #   丢进后台线程 —— 因为问进程要 1537ms、找解释器要 513ms，同步跑会让
+        #   「运行环境」页在入口白掉两秒（1.1.0 刚修掉的那种卡）。
+        #   所以这里调「确定性的一对」：纯函数 → 回填。线程行为另行单独断言。
         wizard_mod.locate_gateway_dir = lambda cur=None: (
             _gwdir.resolve(), "正在运行的网关进程", 9999)
         try:
             wz.w_dir.setText(
                 "C:\\Users\\Administrator\\AppData\\Local\\Programs\\LuoboBox\\codebuddy2api")
-            wz._probe()
+            _res = wizard_mod.probe_environment(
+                wz.w_dir.text(), wz.w_py.text(), int(wz.w_port.value()))
+            check("探测结果是纯 dict，不碰控件（这样才能丢进线程）",
+                  isinstance(_res, dict)
+                  and {"dir", "port", "py", "lines", "warn", "ok_hint"} <= set(_res),
+                  str(sorted(_res)) if isinstance(_res, dict) else type(_res).__name__)
+            wz._apply_probe(_res)
             check("自动探测把填错的网关目录改对了",
                   Path(wz.w_dir.text()) == _gwdir.resolve(), wz.w_dir.text())
             check("自动探测连端口一起采纳（否则同目录会起第二个实例）",
@@ -942,6 +953,62 @@ def main() -> int:
         _paths.gateway_dir_candidates = _o_cands
         _paths.gateway_from_process = _o_proc
 
+    # 自动探测必须**不阻塞主线程**：问进程 1537ms + 找解释器 513ms，同步跑就是
+    # 「进入运行环境页白掉两秒」—— 1.1.0 专门修掉的那种卡，不能再塞回来。
+    # 断言办法：把 run_task 换成"只记录、不执行"的替身 → _probe() 应当立刻返回。
+    import time as _time
+    _calls: list = []
+    _o_run_task = ctx.run_task
+    # ★ 替身要**照抄真签名**：`AppContext.run_task` 只认
+    #   (fn, on_ok, on_err, busy_text)，**不转发额外参数**。
+    #   写成 `*a, **k` 的宽松替身会把「多传了参数」这种错掩盖掉 ——
+    #   真踩过：自测全绿，实机一进向导就 TypeError。
+    ctx.run_task = lambda fn, ok=None, err=None, busy_text=None: _calls.append((fn, ok))
+    try:
+        wz._probing = False
+        wz.probe_out.setText("")
+        _o_find_py = wizard_mod.find_python
+        # 纯函数里最贵的是 find_python（实测 513ms），这里换掉只为让断言快。
+        wizard_mod.find_python = lambda preferred=None: (  # noqa: ARG005
+            None, [(Path(r"C:\nope\python.exe"), "文件不存在")])
+        try:
+            _t0 = _time.perf_counter()
+            wz._probe()
+            _dt = (_time.perf_counter() - _t0) * 1000
+            check("自动探测把活丢给后台线程，自己不阻塞",
+                  len(_calls) == 1 and _dt < 300,
+                  f"{_dt:.1f}ms  calls={len(_calls)}")
+            _res2 = _calls[0][0]() if _calls else None
+            check("丢进线程的那个可调用对象，跑起来真的产出探测结果",
+                  isinstance(_res2, dict) and "dir" in _res2, str(_res2)[:60])
+        finally:
+            wizard_mod.find_python = _o_find_py
+        check("探测期间显示「探测中…」并按住「下一步」",
+              wz.probe_out.text() == "探测中…" and not wz.btn_next.isEnabled()
+              and not wz.btn_probe.isEnabled(),
+              f"{wz.probe_out.text()!r} next={wz.btn_next.isEnabled()}")
+        wz._probe()
+        check("连点「自动探测」不会攒出第二个线程", len(_calls) == 1, str(len(_calls)))
+
+        # 结果回来（后台回调）→ 按钮放开、内容回填
+        wz._apply_probe({"dir": "", "port": None, "py": "", "lines": ["✗ 没找到"],
+                         "warn": "这台机器上没找到 Python", "ok_hint": ""})
+        check("结果回来就放开按钮并回填内容",
+              wz.btn_next.isEnabled() and wz.btn_probe.isEnabled()
+              and not wz._probing and "没找到" in wz.probe_out.text(),
+              f"next={wz.btn_next.isEnabled()} text={wz.probe_out.text()[:24]!r}")
+
+        # 后台的活要是炸了，也不能把用户永久卡在「探测中」（下一步永远点不动）
+        wz._probe()
+        wz._probe_failed("boom")
+        check("探测失败同样放开按钮（不许把用户卡在「探测中」）",
+              wz.btn_next.isEnabled() and wz.btn_probe.isEnabled() and not wz._probing
+              and "boom" in wz.hint.text(),
+              wz.hint.text()[:40])
+    finally:
+        ctx.run_task = _o_run_task
+        wz._probing = False
+
     # --- 回归：窗口比内容矮时，行**不能**被压塌。
     # 用户报过「运行环境页中间区域显示异常」：Python 输入框只剩 3px、「一键修复
     # 环境」和「下载安装包」被压成几像素并互相叠字。根因是每页都是固定高度布局，
@@ -949,6 +1016,14 @@ def main() -> int:
     # Qt 不会溢出而是把每一行压扁。修法：每页套可滚动容器 + 把 probe_out 的
     # 最小高度钉死在「按当前宽度换行后真正需要的高度」。
     from PySide6.QtWidgets import QScrollArea
+
+    # 自动探测现在跑在后台线程里，而下面这些断言（有没有滚动容器 / 行会不会被
+    # 压塌 / 提示块有没有被挤扁）要的是**确定性的同步**：把 run_task 换成立刻
+    # 执行的替身，否则断言会跟还在跑的线程抢 probe_out 的内容。段末还原。
+    # 替身照抄真签名（不写 `*a, **k`）—— 宽松替身会掩盖"多传参数"的错。
+    _o_run_task_sync = ctx.run_task
+    ctx.run_task = (lambda fn, ok=None, err=None, busy_text=None:
+                    ok(fn()) if ok else fn())
 
     wz._goto(1)  # noqa: SLF001
     # ⚠ 必须 show()：没走过布局的 QWidget 还是默认 640×480，行高断言会
@@ -1008,6 +1083,7 @@ def main() -> int:
               40 <= log_h <= 400 and log_h >= need, f"h={log_h} 需要={need}")
     finally:
         _wizard.find_python = _orig_find_python
+    ctx.run_task = _o_run_task_sync       # 还原真后台，别的段还要用
     wz.deleteLater()
 
     # ============================================================ 收尾

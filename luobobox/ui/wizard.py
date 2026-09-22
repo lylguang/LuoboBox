@@ -31,6 +31,73 @@ from ..paths import find_python, icon_path, is_gateway_dir, locate_gateway_dir
 STEPS = ["欢迎", "运行环境", "客户端", "启动方式"]
 
 
+def probe_environment(cur_dir: str = "", cur_py: str = "",
+                      cur_port: int = 8788) -> dict:
+    """探测网关目录与 Python 解释器，返回**只装事实**的字典。
+
+    ★ 刻意做成纯函数、不碰任何控件 —— 因为它跑在后台线程里。
+      这两件事都不便宜：问正在运行的网关进程要起一个 PowerShell（实测 1537ms），
+      `find_python()` 要挨个试跑候选解释器（实测 513ms）。同步跑的话，每次进入
+      「运行环境」页窗口都会白掉两秒 —— 那正是 1.1.0 专门修掉的那种卡。
+      返回值里怎么显示留给主线程决定（`FirstRunWizard._apply_probe`）。
+
+    返回键：dir（路径或空串）/ port（运行中网关的端口或 None）/ py（解释器或空串）
+            / lines（逐行说明，最多 9 行）/ warn（没探到时的提示，无则空串）
+            / ok_hint（探到了时的绿色提示，无则空串）
+    """
+    cur = (cur_dir or "").strip()
+    gw, why, gw_port = locate_gateway_dir(cur)
+
+    lines: list[str] = []
+    if gw is not None:
+        lines.append(f"✓ 网关目录（{why}）：{gw}")
+        # 采纳"运行中的那个网关"的端口。只改目录不改端口的话，照向导点完
+        # 会在**同一份源码目录**上再起一个实例，两个进程同时写同一份
+        # auth/ 与 .env —— 比端口冲突更难查。
+        if gw_port and int(cur_port or 0) != gw_port:
+            lines.append(f"✓ 端口改为 {gw_port}（运行中的网关就在这个端口上）")
+    else:
+        lines.append("✗ 没找到网关源码目录 —— 可以手填，或点「一键修复环境」自动拉一份")
+
+    py, report = find_python((cur_py or "").strip() or None)
+    # 候选里绝大多数是"这台机器上根本没这个路径"，全列出来只会淹没有用信息，
+    # 折成一行计数；真正被检查过但不合格的（缺依赖 / 调用失败）才逐条显示。
+    missing = 0
+    for cand, py_why in report:
+        if py_why == "文件不存在":
+            missing += 1
+            continue
+        lines.append(f"{'✓' if py_why == '可用' else '✗'} {cand}   {py_why}")
+    if missing:
+        lines.append(f"（另有 {missing} 个候选路径不存在，已省略）")
+
+    warn = ""
+    if py is None:
+        # 失败分两种：装了但缺依赖 vs 压根没装 —— 两者下一步动作完全不同。
+        if any(w.startswith(("缺依赖", "调用失败")) for _, w in report):
+            warn = ("找到 Python 但缺少依赖，点「一键修复环境」会自动装齐；"
+                    "或手动执行 pip install fastapi uvicorn httpx。")
+        else:
+            warn = ("这台机器上没找到 Python —— 点上面「一键修复环境」"
+                    "会自动装一份内置的（免安装）；也可以从下方链接自行安装。")
+
+    if py and gw is not None:
+        ok_hint = f"已定位网关目录与解释器：{gw.name} / {py.name}"
+    elif py:
+        ok_hint = f"已选中可用解释器：{py}"
+    else:
+        ok_hint = ""
+
+    return {
+        "dir": str(gw) if gw is not None else "",
+        "port": gw_port,
+        "py": str(py) if py is not None else "",
+        "lines": lines[:9],
+        "warn": warn,
+        "ok_hint": ok_hint,
+    }
+
+
 def _scrollable(content: QWidget) -> QScrollArea:
     """把一页内容装进可滚动容器。
 
@@ -170,6 +237,9 @@ class FirstRunWizard(QDialog):
             self.setWindowIcon(QIcon(str(icon_path())))
         self.setMinimumSize(660, 560)
         self._env_lines: list[str] = []
+        # 自动探测跑在后台线程里（见 probe_environment 的说明），这个标志防止
+        # 用户连点「自动探测」攒出一堆线程，也用来决定「下一步」能不能点。
+        self._probing = False
         self.env_logged.connect(self._append_env_log)
         self._build()
         self._goto(0)
@@ -489,6 +559,9 @@ class FirstRunWizard(QDialog):
         self.btn_back.setEnabled(index > 0)
         last = index == self.stack.count() - 1
         self.btn_next.setText("完成" if last else "下一步")
+        # 探测还在跑时「下一步」要按住：结果没回填就点过去，校验看到的是
+        # 一份**半截配置**（目录还是那个猜出来的坏值），提示会跟事实不符。
+        self.btn_next.setEnabled(not self._probing)
         if index == 1 and not self.probe_out.text():
             self._probe()
 
@@ -532,65 +605,60 @@ class FirstRunWizard(QDialog):
         self.hint.setStyleSheet(f"color: {theme.WARN};")
 
     def _probe(self) -> None:
-        self.probe_out.setText("探测中…")
+        """自动探测（**后台跑**）。
+
+        ★ 这一页一进来就会调用它，而里头两件事都不便宜（问进程 1537ms +
+          找解释器 513ms）。同步跑的表现是「进这一页窗口白掉两秒」，
+          正是 1.1.0 专门修掉的那种卡，所以整块挪进后台线程。
+        ★ 探测期间把「下一步」按住：不按的话用户能在结果回填前点过去，
+          拿一份**半截配置**去校验，看到的提示跟事实不符。
+        """
+        if self._probing:
+            return
+        self._probing = True
         self.probe_out.setStyleSheet(f"color: {theme.TEXT_DIM};")
-        from PySide6.QtWidgets import QApplication
+        self.probe_out.setText("探测中…")
+        self.btn_probe.setEnabled(False)
+        self.btn_next.setEnabled(False)
+        # ★ 参数在这里就读出来、用闭包带进线程：`run_task` 只认
+        #   (fn, on_ok, on_err, busy_text)，**不转发额外参数**；
+        #   而且工作线程本来也不该去摸控件（Qt 控件非线程安全）。
+        cur_dir = self.w_dir.text()
+        cur_py = self.w_py.text()
+        cur_port = int(self.w_port.value())
+        self.ctx.run_task(
+            lambda: probe_environment(cur_dir, cur_py, cur_port),
+            self._apply_probe,
+            self._probe_failed,
+        )
 
-        QApplication.processEvents()
-
-        lines: list[str] = []
-
-        # ---- 网关目录：先看现在填的，再看同级/上级，最后**问正在跑的网关进程** ----
-        # ★ 老行为只把 `default_gateway_dir()` 猜出来的那个路径（可能压根不存在）
-        #   填进输入框，用户点「下一步」只得到一句「找不到 converter.py」，
-        #   而他能做的只有自己去翻盘。可是机器上有人知道答案 —— 那个正在跑的
-        #   网关的命令行里就写着真实目录与端口。
-        cur = self.w_dir.text().strip()
-        gw, why, gw_port = locate_gateway_dir(cur)
-        if gw is not None:
-            if str(gw) != cur:
-                self.w_dir.setText(str(gw))
-            lines.append(f"✓ 网关目录（{why}）：{gw}")
-            # 采纳"运行中的那个网关"的端口。只改目录不改端口的话，照向导点完
-            # 会在**同一份源码目录**上再起一个实例，两个进程同时写同一份
-            # auth/ 与 .env —— 比端口冲突更难查。
-            if gw_port and int(self.w_port.value()) != gw_port:
-                self.w_port.setValue(gw_port)
-                lines.append(f"✓ 端口改为 {gw_port}（运行中的网关就在这个端口上）")
-        else:
-            lines.append("✗ 没找到网关源码目录 —— 可以手填，或点「一键修复环境」自动拉一份")
-
-        py, report = find_python(self.w_py.text().strip() or None)
-        # 候选里绝大多数是"这台机器上根本没这个路径"，全列出来只会淹没有用信息，
-        # 折成一行计数；真正被检查过但不合格的（缺依赖 / 调用失败）才逐条显示。
-        missing = 0
-        for cand, why in report:
-            if why == "文件不存在":
-                missing += 1
-                continue
-            lines.append(f"{'✓' if why == '可用' else '✗'} {cand}   {why}")
-        if missing:
-            lines.append(f"（另有 {missing} 个候选路径不存在，已省略）")
-        self.probe_out.setText("\n".join(lines[:9]) or "未发现任何 Python 解释器。")
-        if py:
+    def _apply_probe(self, res: dict) -> None:
+        """把探测结果回填到表单（永远在主线程执行）。"""
+        self._probing = False
+        self.btn_probe.setEnabled(True)
+        self.btn_next.setEnabled(True)
+        if res.get("dir") and res["dir"] != self.w_dir.text().strip():
+            self.w_dir.setText(res["dir"])
+        if res.get("port") and int(self.w_port.value()) != int(res["port"]):
+            self.w_port.setValue(int(res["port"]))
+        self.probe_out.setText(
+            "\n".join(res.get("lines") or []) or "未发现任何 Python 解释器。")
+        if res.get("py"):
             self.py_dl_tip.setVisible(False)
-            self.w_py.setText(str(py))
+            self.w_py.setText(res["py"])
             self.hint.setStyleSheet(f"color: {theme.OK};")
-            if gw is not None:
-                self.hint.setText(f"已定位网关目录与解释器：{gw.name} / {py.name}")
-            else:
-                self.hint.setText(f"已选中可用解释器：{py}")
-
+            self.hint.setText(res.get("ok_hint") or "")
             return
         # 没探到才把下载入口亮出来（这就是"自动适配"：有 Python 时界面不留噪音）。
         self.py_dl_tip.setVisible(True)
-        # 失败分两种：装了但缺依赖 vs 压根没装 —— 两者下一步动作完全不同。
-        if any(why.startswith(("缺依赖", "调用失败")) for _, why in report):
-            self._warn("找到 Python 但缺少依赖，点「一键修复环境」会自动装齐；"
-                       "或手动执行 pip install fastapi uvicorn httpx。")
-        else:
-            self._warn("这台机器上没找到 Python —— 点上面「一键修复环境」"
-                       "会自动装一份内置的（免安装）；也可以从下方链接自行安装。")
+        if res.get("warn"):
+            self._warn(res["warn"])
+
+    def _probe_failed(self, msg: str) -> None:
+        self._probing = False
+        self.btn_probe.setEnabled(True)
+        self.btn_next.setEnabled(True)
+        self._warn(f"探测失败：{(msg or '').splitlines()[0]}")
 
     def _append_env_log(self, text: str) -> None:
         """工作线程 emit 的修复日志落到标签上（永远在主线程执行）。"""
