@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import __version__, net
-from .paths import backup_dir
+from .paths import backup_dir, gateway_dir_missing
 
 API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
 UA = {"User-Agent": f"LuoboBox/{__version__}", "Accept": "application/vnd.github+json"}
@@ -286,6 +286,18 @@ def apply_release(gateway_dir: Path | str, archive: Path) -> ApplyResult:
     try:
         with tempfile.TemporaryDirectory(prefix="luobobox-rel-") as tmp:
             staging = _extract(archive, Path(tmp))
+            # 2b) 解包完整性先于"覆盖线上目录"检查。归档若被截断 / 上游结构变了，
+            # staging 里会缺 `app/` 包 —— 此时若直接往下走，会先 rmtree 掉线上目录里
+            # 好好的 `app/`，再补不回来，留下「converter.py 在、app/ 不在」的坏目录
+            # （正是 2026-09-23 用户报的 `ModuleNotFoundError: No module named 'app'`）。
+            # 所以在**暂存层**就把关：不齐就整体放弃，线上目录要么成功、要么纹丝不动。
+            missing = gateway_dir_missing(staging)
+            if missing:
+                result.ok = False
+                result.message = (
+                    "下载的归档不完整（缺 " + "、".join(missing)
+                    + "）—— 可能是网络截断或上游包结构变了；已保留原有目录未改动")
+                return result
             # 3) 逐项覆盖（保留清单跳过）
             copied: list[str] = []
             stash: list[tuple[Path, Path]] = []

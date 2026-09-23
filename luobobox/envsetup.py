@@ -45,6 +45,7 @@ from .config import DEFAULT_EXTRA_ARGS, gen_api_key, pick_free_port, port_free
 from .paths import (
     DEFAULT_GATEWAY_DIR_NAME,
     REQUIRED_MODULES,
+    bundled_gateway_dir,
     data_dir,
     default_gateway_dir,
     find_python,
@@ -716,7 +717,8 @@ def fix_pointer(cfg=None, **_kw) -> tuple[bool, str]:
     return True, f"指针位置正确：{pointer_primary_path()}"
 
 
-def fetch_gateway(cfg, *, log=None, into: Path | None = None) -> tuple[bool, str]:
+def fetch_gateway(cfg, *, log=None, into: Path | None = None,
+                  attempts: int = 3) -> tuple[bool, str]:
     """从上游仓库拉一份网关源码到数据目录。返回 (是否成功, 说明)。
 
     与「更新网关」复用同一条链路（下载 → 解包 → 打脱敏补丁 → 补内置 WebUI），
@@ -727,14 +729,46 @@ def fetch_gateway(cfg, *, log=None, into: Path | None = None) -> tuple[bool, str
     顶层条目逐个覆盖，并且会跳过 `KEEP_PATHS`（`auth/`、`.env`、启动脚本），
     所以用户的登录凭证和配置都留得住 —— 这正是「只缺 app/ 包」时最该做的事：
     路径不变、凭证不丢、只把缺的那部分补回来。
-    """
-    from . import updater
 
+    落地顺序（都为「首启零网络 / 抗截断」服务）：
+      ① 安装包里**随附**了完整网关源码 → 直接复制到数据目录，连网都不用上；
+      ② 否则联网下载，并对「下载被截断导致归档不完整」做最多 ``attempts`` 次重试
+         （本机实测大文件下载会在 ~16MB 处被切断，单次必败，重试往往能救回来）。
+    """
     repo = str(cfg.get("updater.repo") or "").strip()
-    if not repo:
-        return False, "未配置上游仓库地址，无法自动获取网关源码"
     root = data_dir() / "gateway"
     target = Path(into) if into else (root / DEFAULT_GATEWAY_DIR_NAME)
+
+    # ① 零网络首启：随附的整份源码直接当复制源（本地、瞬时、必然完整）。
+    #    仅当目标还不存在时才用——已存在的目录（哪怕是坏掉的）交给下面的
+    #    下载/补齐逻辑去修，避免无谓覆盖一份用户可能改过的目录。
+    bundled = bundled_gateway_dir()
+    if bundled is not None and not target.exists():
+        try:
+            if log:
+                log(f"       安装包自带网关源码 → 复制到 {target}")
+            shutil.copytree(bundled, target, dirs_exist_ok=True)
+            try:
+                patcher.ensure(target)
+            except Exception as exc:  # noqa: BLE001
+                if log:
+                    log(f"       重打脱敏补丁时出错（可稍后手动）：{exc}")
+            try:
+                from . import webui
+                webui.ensure(target)
+            except Exception:  # noqa: BLE001
+                pass
+            if not gateway_dir_missing(target):
+                cfg.set("gateway.dir", str(target))
+                cfg.set("app.last_gateway_dir", str(target))
+                return True, f"已就位（使用安装包自带网关源码）→ {target}"
+        except Exception as exc:  # noqa: BLE001
+            if log:
+                log(f"       自带源码复制失败，改走联网下载：{exc}")
+
+    if not repo:
+        return False, "未配置上游仓库地址，无法自动获取网关源码"
+    from . import updater
     try:
         if log:
             log(f"       查询上游最新版本：{repo}")
@@ -744,24 +778,32 @@ def fetch_gateway(cfg, *, log=None, into: Path | None = None) -> tuple[bool, str
         if not info.url_ok():
             return False, "上游没有可下载的发行包"
         url = info.zipball or info.tarball
-        if log:
-            log(f"       下载网关源码（{info.tag or '最新'}）")
-        archive = updater.download(url, root / "_downloads")
-        target.mkdir(parents=True, exist_ok=True)
-        res = updater.apply_release(target, archive)
-        if not res.ok:
-            return False, res.message
+        last = "未知错误"
+        for attempt in range(1, max(1, attempts) + 1):
+            try:
+                if log:
+                    log(f"       下载网关源码（{info.tag or '最新'}，第 {attempt}/{attempts} 次）")
+                archive = updater.download(url, root / "_downloads")
+                target.mkdir(parents=True, exist_ok=True)
+                res = updater.apply_release(target, archive)
+                if not res.ok:
+                    last = res.message
+                elif gateway_dir_missing(target):
+                    # apply_release 已确认 staging 完整才会成功，这里再兜一层。
+                    last = ("下载完成但网关源码仍不完整（缺 "
+                            + "、".join(gateway_dir_missing(target))
+                            + "）—— 上游包结构可能变了")
+                else:
+                    cfg.set("gateway.dir", str(target))
+                    cfg.set("app.last_gateway_dir", str(target))
+                    return True, f"已自动获取网关源码（{info.tag or '最新'}）→ {target}"
+            except Exception as exc:  # noqa: BLE001
+                last = f"获取网关源码失败：{type(exc).__name__}: {exc}"
+            if log:
+                log(f"       ⚠ 第 {attempt} 次未成功：{str(last)[:120]}")
+        return False, last
     except Exception as exc:  # noqa: BLE001
         return False, f"获取网关源码失败：{type(exc).__name__}: {exc}"
-    # 判据和 is_gateway_dir() 同源 —— 只有 converter.py 是不够的，
-    # 缺 app/ 包照样跑不起来（见 paths.gateway_dir_problem）。
-    missing = gateway_dir_missing(target)
-    if missing:
-        return False, ("下载完成但网关源码仍不完整（缺 " + "、".join(missing)
-                       + "）—— 上游包结构可能变了")
-    cfg.set("gateway.dir", str(target))
-    cfg.set("app.last_gateway_dir", str(target))
-    return True, f"已自动获取网关源码（{info.tag or '最新'}）→ {target}"
 
 
 def fix_gateway_dir(cfg, *, log=None, **_kw) -> tuple[bool, str]:

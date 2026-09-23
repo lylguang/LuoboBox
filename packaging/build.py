@@ -216,6 +216,65 @@ def human(n: int) -> str:
     return f"{n:.1f} TB"
 
 
+# ---------------------------------------------------------------------------
+# 随附网关源码（首启零网络）
+#
+# 萝卜盒自己不带网关源码 —— 网关是上游 maiphucgiang/codebuddy2api，运行时再从
+# GitHub 拉。但「下载被截断 → 只剩 converter.py、缺 app/」这个坑真实存在
+# （2026-09-23 用户报的 `ModuleNotFoundError: No module named 'app'`），而且
+# 新机器首启往往还没配代理，下载极易失败。
+#
+# 最稳的做法：把一份**完整**的网关源码随安装包/便携包一起打进去，首启时直接
+# 复制到数据目录，连网都不用上。找不到来源就跳过，安装包退回「首启联网下载」。
+# ---------------------------------------------------------------------------
+
+def find_gateway_source() -> Path | None:
+    """定位要随附进安装包的网关源码目录。
+
+    优先级：① 环境变量 LUOBOBOX_GATEWAY_SRC；② 项目根目录同级的 codebuddy2api/
+    （本机布局就是 luobobox 与 codebuddy2api 并列）；③ 仓库根下的 codebuddy2api/。
+    找不到或该目录本身不完整则返回 None。
+    """
+    candidates: list[Path] = []
+    env = os.environ.get("LUOBOBOX_GATEWAY_SRC")
+    if env:
+        candidates.append(Path(env))
+    candidates.append(ROOT.parent / "codebuddy2api")
+    candidates.append(ROOT / "codebuddy2api")
+    for c in candidates:
+        if (c / "converter.py").is_file() and (c / "app" / "__init__.py").is_file():
+            return c
+    return None
+
+
+GATEWAY_IGNORE = shutil.ignore_patterns(
+    ".git", "__pycache__", "*.pyc", "*.pyo",
+    "node_modules", "web/dist", "auth", ".env", ".env.example",
+    "*.log", ".venv", "venv", ".mypy_cache", ".pytest_cache",
+)
+
+
+def bundle_gateway() -> bool:
+    """把网关源码随附进产物目录 dist/LuoboBox/gateway/codebuddy2api。
+
+    随附包里**不带** auth/ 与 .env（那是开发者私人的，带进去会污染用户机器），
+    也不带 web/dist（用户机器上由 webui.ensure 补齐）。但 converter.py 与 app/
+    必须齐 —— 这正是「能跑」的最低判据（见 paths.is_gateway_dir）。
+    """
+    src = find_gateway_source()
+    if src is None:
+        log("未找到要随附的网关源码（设 LUOBOBOX_GATEWAY_SRC 可指定），跳过随附。")
+        return False
+    dst = DIST / "LuoboBox" / "gateway" / "codebuddy2api"
+    log(f"随附网关源码 {src} → {dst}")
+    if dst.exists():
+        shutil.rmtree(dst, ignore_errors=True)
+    shutil.copytree(src, dst, ignore=GATEWAY_IGNORE)
+    ok = (dst / "converter.py").is_file() and (dst / "app" / "__init__.py").is_file()
+    log("随附网关：" + ("完整 ✓" if ok else "不完整 ✗（将导致首启仍走联网下载）"))
+    return ok
+
+
 def make_portable_zip(version: str, build_id: str) -> Path:
     src = DIST / "LuoboBox"
     # 纯 ASCII 名：中文在 GitHub Release 资产名里会被吞掉（见文件头注释）
@@ -288,6 +347,9 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; Flags: unchecked
 ; 我们为了不弹 UAC、并支持装到 D:\\ 这类用户可写目录，坚持 lowest，
 ; 所以它只在用户恰好以管理员身份运行时兜底 —— 真正吃劲的是 [Code] 里的确定性杀进程。
 Source: "{ROOT / 'dist' / 'LuoboBox'}\\*"; DestDir: "{{app}}"; Flags: ignoreversion recursesubdirs createallsubdirs restartreplace
+; 随附的网关源码（首启零网络）：仅当 build.py 把它打进 dist/LuoboBox/gateway 时存在。
+; 缺失也无害 —— 缺失时安装包退回「首启联网下载」，只是多一步。
+Source: "{ROOT / 'dist' / 'LuoboBox' / 'gateway'}\\*"; DestDir: "{{app}}\\gateway"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{{group}}\\{{#AppName}}"; Filename: "{{app}}\\{{#AppExe}}"
@@ -457,7 +519,13 @@ def main() -> int:
     ap.add_argument("--no-selftest", action="store_true", help="跳过产物自检")
     ap.add_argument("--allow-missing-webui", action="store_true",
                     help="允许在没有内置 WebUI 的情况下打包（会导致 /dashboard/ 503）")
+    ap.add_argument("--gateway-src", default=None,
+                    help="随附进安装包的网关源码目录（默认自动探测，也可用 "
+                         "LUOBOBOX_GATEWAY_SRC 环境变量指定）")
     args = ap.parse_args()
+
+    if args.gateway_src:
+        os.environ["LUOBOBOX_GATEWAY_SRC"] = str(Path(args.gateway_src).resolve())
 
     version = read_version()
     build_id = time.strftime("%Y%m%d-%H%M%S")
@@ -483,6 +551,10 @@ def main() -> int:
     write_version_info(version)
     staged = run_pyinstaller(build_id)
     swap_into_place(staged / "LuoboBox", DIST / "LuoboBox", build_id)
+
+    # 把一份完整的网关源码随附进产物（首启零网络）。找不到来源就跳过，
+    # 安装包退回「首启联网下载」。必须在 zip / installer 之前，二者才会带上它。
+    bundle_gateway()
 
     target = DIST / "LuoboBox"
     exe = target / "LuoboBox.exe"

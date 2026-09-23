@@ -440,6 +440,26 @@ def default_gateway_dir() -> Path:
     return candidates[0].resolve()
 
 
+def bundled_gateway_dir() -> Path | None:
+    """安装包/便携包里**随附**的网关源码目录（若打包时把它打进去了）。
+
+    用途：**零网络首启**。新机器装好萝卜盒后，无需联网即可拿到一份完整的
+    codebuddy2api（含 `app/` 包），彻底绕开「运行时下载被截断 → 只剩
+    converter.py、缺 app/」这个真实踩过的坑（见 2026-09-23 用户报的
+    `ModuleNotFoundError: No module named 'app'`）。
+
+    * 仅 FROZEN（打包形态）有意义；源码形态下返回 None（开发时用别的方式定位）。
+    * 用 `is_gateway_dir()` 判定，所以随附包本身不完整时返回 None，自动退化为
+      联网下载，不会把一个坏目录当宝贝。
+    * 返回的目录在**安装目录内部**（通常不可写），只作「复制源」，真正跑的是
+      复制到数据目录后那份（见 `envsetup.fetch_gateway`）。
+    """
+    if not FROZEN:
+        return None
+    cand = app_root() / "gateway" / DEFAULT_GATEWAY_DIR_NAME
+    return cand if is_gateway_dir(cand) else None
+
+
 def gateway_from_process(timeout: int = 12) -> tuple[Path, int | None] | None:
     """问**正在运行的网关进程**：返回 ``(网关源码目录, 它的端口 或 None)``。
 
