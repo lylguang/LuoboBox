@@ -160,7 +160,10 @@ def _toolbar_flags(state: str, busy: bool) -> dict[str, bool]:
         "start": not occupied and not busy,
         "stop": state in ("running", "external", "starting"),
         "restart": running,
-        "dashboard": reachable,
+        # 管理台按钮**始终可点**：网关没起时点了，_open_dashboard 会给明确提示并
+        # 顺手尝试启动，而不是把一个灰按钮甩给用户、让人以为坏了（2026-09-23 另一台
+        # 机器「网页版管理台打不开」的症结——网关没起→按钮误灰→点不动）。
+        "dashboard": True,
     }
 
 
@@ -1958,7 +1961,18 @@ class MainWindow(QMainWindow):
         上游 Release 从不带 web/dist，升级网关就会把它冲掉 → /dashboard/ 503。
         这里现场自愈：先用萝卜盒内置的预构建 dist 补齐，再开浏览器。
         拷贝只有几百 KB，同步做掉即可，不必走后台线程。
+
+        按钮现在**始终可点**（不再因"网关未运行"置灰）。网关没起时点了不会傻开一个
+        浏览器去撞"无法连接"，而是明确提示并顺手尝试启动网关——这正是另一台机器
+        「网页版管理台打不开」的症结（网关没起→按钮误灰→点不动）。
         """
+        # 可达性：健康轮询已通 或 状态机判定在跑，都算能开。
+        reachable = self.ctx.health.ok or self.ctx.quick_state in ("running", "external")
+        if not reachable:
+            self._on_toast(
+                "网关未运行，无法打开网页版管理台。正在尝试启动网关……", "warn")
+            self.ctx.start_gateway()
+            return
         try:
             from .. import webui
 

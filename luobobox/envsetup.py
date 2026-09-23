@@ -739,11 +739,13 @@ def fetch_gateway(cfg, *, log=None, into: Path | None = None,
     root = data_dir() / "gateway"
     target = Path(into) if into else (root / DEFAULT_GATEWAY_DIR_NAME)
 
-    # ① 零网络首启：随附的整份源码直接当复制源（本地、瞬时、必然完整）。
-    #    仅当目标还不存在时才用——已存在的目录（哪怕是坏掉的）交给下面的
-    #    下载/补齐逻辑去修，避免无谓覆盖一份用户可能改过的目录。
+    # ① 零网络首启 / 离线修复：随附的整份源码直接当复制源（本地、瞬时、必然完整）。
+    #    目标「不存在」或「已存在但不完整（缺 app/ 等）」都用它——前者是全新首启，
+    #    后者是「升级覆盖了一处坏目录」的就地补齐（这正是别的机器全新安装后
+    #    gateway 崩 ModuleNotFoundError 的同一类坏目录）；只有目标已完整时才交给
+    #    下面的下载/补齐逻辑（避免无谓覆盖用户可能改过的目录）。
     bundled = bundled_gateway_dir()
-    if bundled is not None and not target.exists():
+    if bundled is not None and (not target.exists() or gateway_dir_missing(target)):
         try:
             if log:
                 log(f"       安装包自带网关源码 → 复制到 {target}")

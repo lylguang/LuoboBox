@@ -542,9 +542,11 @@ def main() -> int:
     check("「重启」只在自家托管的 running 下可点（external 不抢）",
           [_toolbar_flags(st, False)["restart"]
            for st in ("stopped", "starting", "running", "external")] == [False, False, True, False])
-    check("「网页版管理台」在可连通时就可点",
+    # 2026-09-23：管理台按钮改为「始终可点」（网关未运行时点了会给明确提示并尝
+    # 试启动），不再因网关未运行而置灰。所以三种状态都应为 True。
+    check("「网页版管理台」始终可点（网关未运行点了会给明确提示）",
           [_toolbar_flags(st, False)["dashboard"]
-           for st in ("stopped", "running", "external")] == [False, True, True])
+           for st in ("stopped", "running", "external")] == [True, True, True])
 
     # 上面那张表必须真的是 win 用的那张 —— 否则测试只是自说自话。
     real = _toolbar_flags(win.ctx.gateway.state, win.ctx.runner.busy())
