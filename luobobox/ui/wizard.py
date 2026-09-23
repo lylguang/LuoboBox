@@ -26,7 +26,13 @@ from . import theme
 from .widgets import IOSSwitch
 from .. import __version__, autostart
 from ..config import gen_api_key, port_free
-from ..paths import find_python, icon_path, is_gateway_dir, locate_gateway_dir
+from ..paths import (
+    find_python,
+    gateway_dir_problem,
+    icon_path,
+    is_gateway_dir,
+    locate_gateway_dir,
+)
 
 STEPS = ["欢迎", "运行环境", "客户端", "启动方式"]
 
@@ -577,15 +583,18 @@ class FirstRunWizard(QDialog):
     def _validate_runtime(self) -> bool:
         gw = Path(self.w_dir.text().strip())
         if not is_gateway_dir(gw):
-            # 分开说：路径压根不存在 vs 存在但不是网关目录。老版本只有后面那一句，
+            # 分开说：路径压根不存在 vs 存在但不够格当网关目录。老版本只有后面那一句，
             # 于是"向导把一个不存在的默认值填进去"这种情况，用户看到的是
             # 「请确认目录是否正确」—— 而那个目录从来就不该被填进去。
             if not gw.exists():
                 self._warn(f"这个目录不存在：{gw}\n点「自动探测」会自动定位网关目录"
                            "（含正在运行的那个网关），也可以直接点「一键修复环境」。")
             else:
-                self._warn("网关目录里找不到 converter.py，请确认目录是否正确"
-                           "（正确的网关源码目录里应该有 converter.py）。")
+                # 具体缺什么交给 paths.gateway_dir_problem() 说 —— 「没有
+                # converter.py」和「有 converter.py、缺 app/ 包」是两回事，
+                # 后者放过去启动必然以 ModuleNotFoundError 收场，必须点名。
+                self._warn(gateway_dir_problem(gw)
+                           + "\n点「一键修复环境」可以自动把它补好。")
             return False
         if not Path(self.w_py.text().strip()).exists():
             self._warn("Python 解释器路径不存在，请点「自动探测」，或从下方链接下载安装。")

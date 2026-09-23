@@ -445,8 +445,7 @@ def gateway_from_process(timeout: int = 12) -> tuple[Path, int | None] | None:
 
     ★ 为什么要问进程：网关源码放在哪儿是用户的自由。靠 `app_root()` 逐级向上猜，
       在「exe 装在默认位置、网关源码放在别的盘」这种最常见的组合下必然猜错 ——
-      表现为向导把一个**不存在的路径**填进输入框，提示只有一句
-      「网关目录里找不到 converter.py，请确认目录是否正确」，而用户能做的只有
+      表现为向导把一个**不存在的路径**填进输入框，而用户能做的只有
       自己去找。可是机器上明明有人知道答案：那个正在跑的网关，它的命令行里
       就写着 `<网关目录>\\converter.py serve --host … --port …`。
 
@@ -564,9 +563,96 @@ def locate_gateway_dir(current: str | Path | None = None
     return None, "", None
 
 
-def is_gateway_dir(path: Path | str) -> bool:
+# 🔴 「是不是网关目录」不能只看 converter.py 在不在。
+#
+# 上游 converter.py 的第 1 段就是 `from app.adapters.responses_adapter import …`。
+# 这句话能不能成立，取决于 **app/ 包在不在同一个目录里** —— 而 converter.py
+# 在不在，完全说明不了 app/ 在不在：半途中断的下载、手工拷了一半的目录、
+# 被别的东西覆盖过的目录，都会留下「有 converter.py、没有 app/」这种状态。
+#
+# 这种目录以前会被判成「合格的网关目录」，然后一路通过所有检查被启动，子进程
+# 只会在 line 40 抛一句
+#     ModuleNotFoundError: No module named 'app'
+# 并以退出码 1 死掉（2026-09-23 用户就是这么报上来的：
+#  gateway.log 里 8 段 traceback，全部收尾于这一句）。
+#
+# 所以判据必须是「两个都在」，而且第二个**从 converter.py 自己的源码里读出来**
+# —— 不写死 app/：万一上游改了布局，这里会跟着源码走，不会变成假警报。
+_GATEWAY_APP_IMPORT = re.compile(r"^[ \t]*(?:from|import)[ \t]+app(?:[.\s]|$)", re.M)
+
+# converter.py 通常 130~210 KB；超过这个大小就不再全文扫（防意外读进巨大文件）
+_GATEWAY_SOURCE_SCAN_LIMIT = 4 * 1024 * 1024
+
+# {converter.py 路径小写: (大小, mtime_ns, 是否 import app)}
+_GATEWAY_NEEDS_APP_CACHE: dict[str, tuple[int, int, bool]] = {}
+
+
+def _gateway_needs_app(converter: Path) -> bool:
+    """converter.py 自己有没有 ``import app`` —— 有才要求 app/ 包必须在。
+
+    带缓存：`is_gateway_dir()` 会被候选目录循环反复调用，而 converter.py
+    有 200 KB 上下，每次都全文读一遍纯属浪费。缓存键带 (大小, mtime_ns)，
+    源码被换掉之后自然失效。
+    """
+    try:
+        st = converter.stat()
+    except OSError:
+        return False
+    key = str(converter).lower()
+    cached = _GATEWAY_NEEDS_APP_CACHE.get(key)
+    if cached is not None and cached[0] == st.st_size and cached[1] == st.st_mtime_ns:
+        return cached[2]
+    needs = False
+    if st.st_size <= _GATEWAY_SOURCE_SCAN_LIMIT:
+        try:
+            text = converter.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        needs = bool(_GATEWAY_APP_IMPORT.search(text))
+    _GATEWAY_NEEDS_APP_CACHE[key] = (st.st_size, st.st_mtime_ns, needs)
+    return needs
+
+
+def gateway_dir_missing(path: Path | str) -> tuple[str, ...]:
+    """这个目录**缺什么**才够资格当网关目录。空元组 = 合格。
+
+    只返回短名字（给界面拼句子用）；长解释见 `gateway_dir_problem()`。
+    """
     p = Path(path)
-    return (p / "converter.py").is_file()
+    converter = p / "converter.py"
+    if not converter.is_file():
+        return ("converter.py",)
+    if _gateway_needs_app(converter) and not (p / "app" / "__init__.py").is_file():
+        return ("app/__init__.py",)
+    return ()
+
+
+def gateway_dir_problem(path: Path | str) -> str:
+    """人话版的问题描述。合格时返回空串。
+
+    与 `gateway_dir_missing()` 分开：那个给程序判断，这个给用户看。
+    """
+    p = Path(path)
+    missing = gateway_dir_missing(p)
+    if not missing:
+        return ""
+    if "converter.py" in missing:
+        return (f"{p} 里没有 converter.py"
+                "（正确的网关源码目录里应该有 converter.py）。")
+    return (f"{p} 里只有 converter.py，缺少 app/ 包 —— "
+            "converter.py 第 1 段就是 `from app.… import`，这么启动会直接以 "
+            "ModuleNotFoundError: No module named 'app'（退出码 1）退出。"
+            "点「一键配置环境」（设置 → 运行环境）或向导里的「一键修复环境」"
+            "会就地把它补齐，auth/ 与 .env 都保留。")
+
+
+def is_gateway_dir(path: Path | str) -> bool:
+    """这个目录**能跑**吗 —— converter.py 与它依赖的 app/ 包都在才算数。
+
+    只查 converter.py 是错的，理由见上面那段注释：那会放行一个必然以
+    ``ModuleNotFoundError: No module named 'app'`` 崩掉的目录。
+    """
+    return not gateway_dir_missing(path)
 
 
 # ---------------------------------------------------------------- Python

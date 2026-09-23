@@ -1042,6 +1042,24 @@ def main() -> int:
             wz._validate_runtime()
             check("目录在但不是网关目录时说清缺的是 converter.py",
                   bool(warned) and "converter.py" in warned[0], str(warned[:1]))
+
+            # 「没有 converter.py」和「有 converter.py、缺 app/ 包」是两回事。
+            # 后者要是放过去，启动必然以
+            #   ModuleNotFoundError: No module named 'app'
+            # 收场（2026-09-23 用户报的就是这个）。提示必须点名，
+            # 否则用户照「请确认目录是否正确」怎么查都查不出问题。
+            _gwpart = Path(tempfile.mkdtemp(prefix="luobobox-gwpartial-"))
+            (_gwpart / "converter.py").write_text(
+                "from app.adapters.responses_adapter import convert\n",
+                encoding="utf-8")
+            wz.w_dir.setText(str(_gwpart))
+            warned.clear()
+            wz._validate_runtime()
+            check("★ 有 converter.py、缺 app/ 时提示点名 ModuleNotFoundError",
+                  bool(warned) and "ModuleNotFoundError" in warned[0],
+                  str(warned[:1]))
+            check("★ 同一提示里给出补法（一键修复环境）",
+                  bool(warned) and "一键修复环境" in warned[0], str(warned[:1]))
         finally:
             wizard_mod.locate_gateway_dir = _o_wiz_locate
             wz._warn = _o_warn

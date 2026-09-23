@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import Config, port_free
-from .paths import gateway_log, pythonw_for
+from .paths import gateway_dir_problem, gateway_log, pythonw_for
 
 CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -328,6 +328,21 @@ class GatewayManager:
     def start(self, wait_seconds: int = 25) -> tuple[bool, str]:
         if self.owned:
             return True, "网关已在运行"
+        # ★ 开局先验源码目录，而且要在起子进程**之前**。
+        #   一个「有 converter.py、没有 app/」的目录是**必然**失败的：converter.py
+        #   第 1 段就 `from app.… import`，Python 只会给一句
+        #     ModuleNotFoundError: No module named 'app'
+        #   再以退出码 1 死掉。真去起一次，除了多等十几秒、往日志里灌 8 行
+        #   traceback，什么也换不来；这里提前拦下，直接把「缺什么、点哪儿补」
+        #   说清楚（补法见 envsetup.fix_gateway_dir：就地补齐，auth/ 与 .env 保留）。
+        problem = gateway_dir_problem(Path(str(self.config.get("gateway.dir") or "")))
+        if problem:
+            self._state = STATE_ERROR
+            self._last_error = problem
+            self._log(f"[gateway] 启动前检查未通过：{problem}")
+            return False, problem + (
+                "\n点「一键配置环境」（设置 → 运行环境），或向导里的「一键修复环境」，"
+                "即可就地补齐。")
         # fresh=True：启停这种决定性的判断不吃 0.25s 的短缓存，要真值。
         if not port_free(self.port, fresh=True):
             # 端口被占 ≠ 一定是别人的。stop_on_exit 默认 false，退出萝卜盒时网关会

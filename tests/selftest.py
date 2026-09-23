@@ -599,6 +599,158 @@ def test_gateway_failure_message(work: Path) -> None:
             os.environ["LUOBOBOX_DATA_DIR"] = prev
 
 
+# ============================================================ 6d. 网关目录完整度
+
+def test_gateway_dir_completeness(work: Path) -> None:
+    """回归：只有 converter.py、没有 app/ 的目录**不能**被当成合格的网关目录。
+
+    2026-09-23 用户报上来 8 段一模一样的 traceback，全部收尾于
+        ModuleNotFoundError: No module named 'app'
+    来源写着 `...\\gateway\\codebuddy2api\\converter.py` —— 目录里 converter.py
+    在，就是没有 app/。而当时 `is_gateway_dir()` 只查 converter.py 在不在，于是
+    这种目录一路通过所有检查被启动，只留下一句谁也看不懂的 ModuleNotFoundError
+    （加上一个更让人无从下手的「进程提前退出（退出码 1）」）。
+
+    这里锁住四件事：
+      · 缺 app/ 能被认出来，而且判据是**从 converter.py 自己的 import 推出来的**
+        （不是写死 app/，否则上游换布局就变成永远修不好的假警报）
+      · 体检 / 启动前拦截都点名「缺 app/」，不再说「找不到 converter.py」
+      · 启动前就拦下，不白起一次子进程
+      · 修复动作是**就地补齐**：不换目录、不丢 auth/ 与 .env
+    """
+    print("\n[6d] 网关目录必须带上 app/ 包（否则必然 ModuleNotFoundError）")
+    from luobobox import envsetup
+    from luobobox.config import Config, pick_free_port
+    from luobobox.gateway import GatewayManager
+    from luobobox.paths import (
+        gateway_dir_missing,
+        gateway_dir_problem,
+        is_gateway_dir,
+    )
+
+    conv_src = ("import os\n"
+                "from app.adapters.responses_adapter import convert\n"
+                "\n"
+                "print('serve')\n")
+
+    empty = work / "gw3_empty"
+    empty.mkdir(parents=True, exist_ok=True)
+    check("空目录 → 缺 converter.py",
+          gateway_dir_missing(empty) == ("converter.py",),
+          str(gateway_dir_missing(empty)))
+
+    partial = work / "gw3_partial"
+    partial.mkdir(parents=True, exist_ok=True)
+    (partial / "converter.py").write_text(conv_src, encoding="utf-8")
+    check("★ 有 converter.py、没 app/ → 缺 app/__init__.py",
+          gateway_dir_missing(partial) == ("app/__init__.py",),
+          str(gateway_dir_missing(partial)))
+    check("★ 这种目录不再算合格网关目录", is_gateway_dir(partial) is False)
+
+    complete = work / "gw3_complete"
+    (complete / "app").mkdir(parents=True, exist_ok=True)
+    (complete / "converter.py").write_text(conv_src, encoding="utf-8")
+    (complete / "app" / "__init__.py").write_text("", encoding="utf-8")
+    check("补上 app/__init__.py 后就合格了", is_gateway_dir(complete) is True)
+
+    # 源码里根本没有 import app 时**不许**要求 app/ —— 否则上游哪天换布局，
+    # 这里会变成一个永远修不好的假警报（修复动作也修不出一个不存在的需求）。
+    fork = work / "gw3_fork"
+    fork.mkdir(parents=True, exist_ok=True)
+    (fork / "converter.py").write_text("import os\nprint('hi')\n", encoding="utf-8")
+    check("源码里没有 import app 时不要求 app/（不误报）", is_gateway_dir(fork) is True)
+
+    prob = gateway_dir_problem(partial)
+    check("问题描述点名 ModuleNotFoundError", "ModuleNotFoundError" in prob)
+    check("问题描述点名缺的是 app/", "app" in prob)
+    check("合格目录的问题描述是空串", gateway_dir_problem(complete) == "")
+
+    # ---------------------------------------------------------- 体检项怎么说
+    cfg = Config()
+    cfg.set("gateway.dir", str(partial))
+    cfg.set("gateway.python", sys.executable)
+    cfg.set("gateway.api_key", "k")
+    cfg.set("gateway.port", 9301)
+    item = envsetup.diagnose(cfg, deep=False).by_key("gateway_dir")
+    check("体检把这种目录判为可修（fix，不是 ok）",
+          item.state == "fix", f"{item.state} / {item.detail[:60]}")
+    check("体检详情点名 app/ 与 ModuleNotFoundError",
+          "app" in item.detail and "ModuleNotFoundError" in item.detail,
+          item.detail[:110])
+    check("修复提示说明 auth/ 与 .env 会保留", "保留" in item.fix_label, item.fix_label)
+
+    # ---------------------------------------------------------- 修复 = 就地补齐
+    seen: list = []
+    orig_fetch = envsetup.fetch_gateway
+    envsetup.fetch_gateway = lambda cfg2, *, log=None, into=None: (
+        seen.append(into) or (True, "[spy]"))
+    try:
+        ok, msg = envsetup.fix_gateway_dir(cfg)
+    finally:
+        envsetup.fetch_gateway = orig_fetch
+    check("部分目录的修复成功", ok is True, msg)
+    check("★ 修复动作是就地补齐（into = 原来那个目录）", seen == [partial], str(seen))
+    check("配置里的路径没被改掉", str(cfg.get("gateway.dir")) == str(partial))
+
+    # 空目录**不能**触发就地补齐：用户把整个盘符填进配置时，
+    # 我们会把一份网关源码撒到那个目录里。
+    #
+    # 注意「猜目录」有三层（配置里记着的 → default_gateway_dir() → 问正在跑的
+    # 网关进程），三层都得掐掉才能稳定复现"本机哪儿都没有"。第一版只掐了第二层，
+    # 结果本机 8789 上那个真网关被问出来了，这条断言当场失败 —— 保留这段注释，
+    # 免得下次有人又只掐一层。
+    seen.clear()
+    orig_dgd = envsetup.default_gateway_dir
+    orig_gfp = envsetup.gateway_dir_from_process
+    envsetup.default_gateway_dir = lambda: work / "gw3_nowhere"
+    envsetup.gateway_dir_from_process = lambda *a, **k: None
+    try:
+        cfg_empty = Config()
+        cfg_empty.set("gateway.dir", str(empty))
+        cfg_empty.set("app.last_gateway_dir", str(work / "gw3_nowhere"))
+        envsetup.fetch_gateway = lambda cfg2, *, log=None, into=None: (
+            seen.append(into) or (True, "[spy]"))
+        try:
+            envsetup.fix_gateway_dir(cfg_empty)
+        finally:
+            envsetup.fetch_gateway = orig_fetch
+    finally:
+        envsetup.default_gateway_dir = orig_dgd
+        envsetup.gateway_dir_from_process = orig_gfp
+    check("★ 空目录走「新下载一份」（into=None），不就地解包",
+          seen == [None], str(seen))
+
+    # ---------------------------------------------------------- 启动前拦截
+    prev = os.environ.get("LUOBOBOX_DATA_DIR")
+    os.environ["LUOBOBOX_DATA_DIR"] = str(work / "gw3_data")
+    try:
+        cfg2 = Config()
+        cfg2.set("gateway.dir", str(partial))
+        cfg2.set("gateway.python", sys.executable)
+        cfg2.set("gateway.host", "127.0.0.1")
+        cfg2.set("gateway.extra_args", [])
+        cfg2.set("gateway.port", pick_free_port(9400))
+        gm = GatewayManager(cfg2)
+        ok, msg = gm.start(wait_seconds=3)
+        check("start() 直接失败", ok is False)
+        check("★ 连子进程都没起（不再白等十几秒换 8 行 traceback）", gm._proc is None)
+        check("消息点名 ModuleNotFoundError", "ModuleNotFoundError" in msg)
+        check("消息给出补法", "一键修复环境" in msg or "一键配置环境" in msg)
+        check("消息里没有 traceback 字样（比 traceback 更好读）",
+              "Traceback" not in msg)
+    finally:
+        if prev is None:
+            os.environ.pop("LUOBOBOX_DATA_DIR", None)
+        else:
+            os.environ["LUOBOBOX_DATA_DIR"] = prev
+
+    # ---------------------------------------------------------- 体检的说法
+    problems = cfg.validate()
+    gw_prob = [p for p in problems if "网关目录" in p]
+    check("validate 说「不完整」而不是「找不到 converter.py」",
+          bool(gw_prob) and "不完整" in gw_prob[0], str(gw_prob))
+
+
 # ============================================================ 7. Funnel
 
 def test_funnel() -> None:
@@ -673,6 +825,7 @@ def main() -> int:
         test_gateway_cmd(tmp)
         test_ensure_ready_port(tmp)
         test_gateway_failure_message(tmp)
+        test_gateway_dir_completeness(tmp)
         test_funnel()
         test_real_gateway()
     finally:

@@ -208,10 +208,14 @@ class AppContext(QObject):
         fixes: list[str] = []
         cfg = self.config
 
-        gw = Path(str(cfg.get("gateway.dir") or ""))
-        if not (gw / "converter.py").is_file():
-            from .paths import default_gateway_dir, is_gateway_dir
+        from .paths import (
+            default_gateway_dir,
+            gateway_dir_missing,
+            is_gateway_dir,
+        )
 
+        gw = Path(str(cfg.get("gateway.dir") or ""))
+        if not is_gateway_dir(gw):
             # 先看上次用过且仍然有效的目录
             remembered = Path(str(cfg.get("app.last_gateway_dir") or ""))
             found: Path | None = None
@@ -225,6 +229,15 @@ class AppContext(QObject):
                 cfg.set("gateway.dir", str(found))
                 cfg.set("app.last_gateway_dir", str(found))
                 fixes.append(f"网关目录 → {found}")
+            elif (gw / "converter.py").is_file():
+                # 目录在、converter.py 也在，缺的是 app/ 包。这种目录两头都不能认：
+                #   · **不能**记成 app.last_gateway_dir —— 那样 locate_gateway_dir()
+                #     会一直把它选回来，坏目录永远自愈不了；
+                #   · **不能**当没问题放过去 —— 启动必定以
+                #     ModuleNotFoundError: No module named 'app'（退出码 1）收场。
+                fixes.append(
+                    "网关目录不完整（缺 " + "、".join(gateway_dir_missing(gw))
+                    + "）—— 到「设置 → 运行环境」点一次「一键修复环境」会就地补齐")
             else:
                 # 刻意**不**写入一个无效路径 —— 那只会把错误藏起来，
                 # 让用户在"目录明明填对了却还是报错"里打转。

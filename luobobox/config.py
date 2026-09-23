@@ -18,6 +18,7 @@ from .paths import (
     backup_dir,
     config_file,
     default_gateway_dir,
+    gateway_dir_missing,
     is_gateway_dir,
 )
 
@@ -225,7 +226,11 @@ class Config:
         if not gw.is_dir():
             problems.append(f"网关目录不存在：{gw}")
         elif not is_gateway_dir(gw):
-            problems.append(f"网关目录里找不到 converter.py：{gw}")
+            # 不能说「找不到 converter.py」—— 它很可能就在那儿，缺的是 app/ 包。
+            # 判据与提示都交给 paths 那边给，避免两处各写一半（见 gateway_dir_problem）。
+            problems.append(
+                "网关目录不完整（缺 " + "、".join(gateway_dir_missing(gw))
+                + "）：" + str(gw))
         port = int(self.get("gateway.port", 0) or 0)
         if not (1 <= port <= 65535):
             problems.append(f"端口非法：{port}")

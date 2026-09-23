@@ -59,6 +59,8 @@ from ..paths import (
     data_dir,
     dir_size,
     find_python,
+    gateway_dir_missing,
+    gateway_dir_problem,
     human_size,
     icon_path,
     is_on_system_drive,
@@ -2347,8 +2349,16 @@ class MainWindow(QMainWindow):
         problems = []
 
         new_dir = Path(self.in_dir.text().strip())
-        if not (new_dir / "converter.py").is_file():
-            problems.append("源码目录里找不到 converter.py")
+        if not new_dir.is_dir():
+            problems.append(f"源码目录不存在：{new_dir}")
+        else:
+            # 不说「找不到 converter.py」—— 它很可能就在那儿，缺的是 app/ 包
+            # （见 paths.gateway_dir_problem）。两者要分得清，否则用户照提示
+            # 去"确认目录是否正确"永远看不出问题。
+            missing = gateway_dir_missing(new_dir)
+            if missing:
+                problems.append(
+                    f"源码目录不完整（缺 {'、'.join(missing)}）：{new_dir}")
         new_py = Path(self.in_python.text().strip())
         if not new_py.exists():
             problems.append("解释器路径不存在")
@@ -2579,7 +2589,10 @@ class MainWindow(QMainWindow):
             lines.append("")
 
             gw = Path(str(cfg.get("gateway.dir", "")))
-            lines.append(f"[网关] 目录      {gw}  {'✓' if (gw / 'converter.py').is_file() else '✗ 找不到 converter.py'}")
+            _gw_missing = gateway_dir_missing(gw)
+            lines.append(f"[网关] 目录      {gw}  "
+                         + ("✓" if not _gw_missing
+                            else "✗ 缺 " + "、".join(_gw_missing)))
             ver = updater.local_version(gw)
             lines.append(f"[网关] 版本      {ver or '未知'}")
             py = Path(str(cfg.get("gateway.python", "")))
@@ -2674,10 +2687,14 @@ class MainWindow(QMainWindow):
         warn = warn_scheduled_task(self.ctx.config)
         if warn:
             self._on_toast(warn, "warn", )
-        from ..paths import is_gateway_dir
-
-        if not is_gateway_dir(self.ctx.config.get("gateway.dir")):
-            self._on_toast("网关目录无效，请到「设置」里指定 codebuddy2api 源码目录", "error")
+        # 用 gateway_dir_problem() 而不是布尔判断 —— 它能把「缺 converter.py」
+        # 和「有 converter.py、缺 app/ 包」分开说，后者是本程序最容易踩的坑。
+        _raw = str(self.ctx.config.get("gateway.dir") or "").strip()
+        problem = gateway_dir_problem(_raw) if _raw else "还没指定网关源码目录。"
+        if problem:
+            self._on_toast(problem
+                           + "\n点「一键配置环境」（设置 → 运行环境）可自动补好。",
+                           "error")
             return
 
         # 启动时补齐内置 WebUI —— 覆盖「升级后没重启过」「dist 从没构建过」等情况

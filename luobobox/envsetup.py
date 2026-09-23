@@ -49,6 +49,8 @@ from .paths import (
     default_gateway_dir,
     find_python,
     gateway_dir_from_process,
+    gateway_dir_missing,
+    gateway_dir_problem,
     is_gateway_dir,
     pointer_legacy_path,
     pointer_primary_path,
@@ -534,6 +536,16 @@ def _gateway_item(cfg) -> Item:
             pass
         return Item("gateway_dir", "网关源码", "ok",
                     f"{gw}" + (f"（{ver}）" if ver else ""))
+    # 「目录在、converter.py 也在，就是缺 app/ 包」是最阴的一种：老版本判它合格，
+    # 一路放行到启动，子进程只在 converter.py 第 1 段崩一句
+    # ModuleNotFoundError: No module named 'app'。必须单独认出来 —— 因为它的
+    # 修复动作不是「换一个目录」而是「就地补齐」（见 fix_gateway_dir）。
+    if (gw / "converter.py").is_file():
+        missing = ", ".join(gateway_dir_missing(gw))
+        return Item("gateway_dir", "网关源码", "fix",
+                    f"{gw} 缺 {missing} —— 这么启动会直接以 "
+                    "ModuleNotFoundError: No module named 'app'（退出码 1）退出",
+                    "就地补齐网关源码（auth/ 与 .env 会保留）")
     found = locate_gateway_dir(cfg)
     shown = str(gw) if str(gw) not in ("", ".") else "（未设置）"
     if found is not None:
@@ -704,11 +716,17 @@ def fix_pointer(cfg=None, **_kw) -> tuple[bool, str]:
     return True, f"指针位置正确：{pointer_primary_path()}"
 
 
-def fetch_gateway(cfg, *, log=None) -> tuple[bool, str]:
+def fetch_gateway(cfg, *, log=None, into: Path | None = None) -> tuple[bool, str]:
     """从上游仓库拉一份网关源码到数据目录。返回 (是否成功, 说明)。
 
     与「更新网关」复用同一条链路（下载 → 解包 → 打脱敏补丁 → 补内置 WebUI），
     所以拿到手就是一份能直接跑的源码，不需要用户再点别的。
+
+    ``into`` 指定落点，默认 ``<数据目录>/gateway/codebuddy2api``。
+    传一个**已存在但不完整**的目录进来就是「就地补齐」：`apply_release()` 是按
+    顶层条目逐个覆盖，并且会跳过 `KEEP_PATHS`（`auth/`、`.env`、启动脚本），
+    所以用户的登录凭证和配置都留得住 —— 这正是「只缺 app/ 包」时最该做的事：
+    路径不变、凭证不丢、只把缺的那部分补回来。
     """
     from . import updater
 
@@ -716,7 +734,7 @@ def fetch_gateway(cfg, *, log=None) -> tuple[bool, str]:
     if not repo:
         return False, "未配置上游仓库地址，无法自动获取网关源码"
     root = data_dir() / "gateway"
-    target = root / DEFAULT_GATEWAY_DIR_NAME
+    target = Path(into) if into else (root / DEFAULT_GATEWAY_DIR_NAME)
     try:
         if log:
             log(f"       查询上游最新版本：{repo}")
@@ -735,14 +753,38 @@ def fetch_gateway(cfg, *, log=None) -> tuple[bool, str]:
             return False, res.message
     except Exception as exc:  # noqa: BLE001
         return False, f"获取网关源码失败：{type(exc).__name__}: {exc}"
-    if not is_gateway_dir(target):
-        return False, "下载完成但没有找到 converter.py（上游包结构可能变了）"
+    # 判据和 is_gateway_dir() 同源 —— 只有 converter.py 是不够的，
+    # 缺 app/ 包照样跑不起来（见 paths.gateway_dir_problem）。
+    missing = gateway_dir_missing(target)
+    if missing:
+        return False, ("下载完成但网关源码仍不完整（缺 " + "、".join(missing)
+                       + "）—— 上游包结构可能变了")
     cfg.set("gateway.dir", str(target))
     cfg.set("app.last_gateway_dir", str(target))
     return True, f"已自动获取网关源码（{info.tag or '最新'}）→ {target}"
 
 
 def fix_gateway_dir(cfg, *, log=None, **_kw) -> tuple[bool, str]:
+    """让「网关源码」这一项变成合格状态。
+
+    三种情况，按代价从低到高：
+      ① 用户填的目录**在、就是缺东西**（典型：只有 converter.py、没有 app/）
+         → **就地补齐**。路径不变、`auth/` 与 `.env` 不丢，只把缺的部分补回来。
+         这是唯一会动用户已有目录的分支，也是最有用的一个：这种目录以前会被
+         判成「合格」直接启动，然后子进程以
+         `ModuleNotFoundError: No module named 'app'` 崩掉，用户完全无从下手。
+      ② 本机别处有一份能用的 → 改用它（不下载）。
+      ③ 哪儿都没有 → 从上游拉一份。
+
+    ① 的入口条件必须同时满足「converter.py 在」—— 只看 `is_dir()` 的话，用户
+    把一个空目录（甚至整个盘符）填进配置时，我们会把一份网关源码解到那儿去。
+    """
+    configured = Path(str(cfg.get("gateway.dir") or ""))
+    if (configured / "converter.py").is_file() and not is_gateway_dir(configured):
+        missing = gateway_dir_missing(configured)
+        if log:
+            log(f"       网关目录缺 {'、'.join(missing)} → 就地补齐：{configured}")
+        return fetch_gateway(cfg, log=log, into=configured)
     found = locate_gateway_dir(cfg)
     if found is None:
         # 本地确实没有 —— 自动拉一份，而不是把问题丢回给用户。

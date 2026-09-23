@@ -84,9 +84,19 @@ WIPED_TERMS = (
 def make_gateway(root: Path, *, terms: str = FULL_TERMS) -> Path:
     """造一个「看起来像 codebuddy2api」的目录。"""
     root.mkdir(parents=True, exist_ok=True)
-    (root / "converter.py").write_text("# 假的网关入口\n", encoding="utf-8")
+    # ★ converter.py 必须**真的** import app，并且 app/__init__.py 也得在。
+    #   is_gateway_dir() 是「从 converter.py 自己的 import 推出要不要 app 包」的
+    #   （见 paths._gateway_needs_app）：伪造一份不带 import 的 converter.py，
+    #   这个 fixture 就落在判据之外 —— 测试照样绿，但真实布局反而测不到。
+    (root / "converter.py").write_text(
+        "import os\n"
+        "from app.desensitize import TERMS\n"
+        "\n"
+        "print('serve')\n",
+        encoding="utf-8")
     app = root / "app"
     app.mkdir(exist_ok=True)
+    (app / "__init__.py").write_text("", encoding="utf-8")
     (app / "desensitize.py").write_text(terms, encoding="utf-8")
     return root
 
@@ -289,6 +299,45 @@ def main() -> int:  # noqa: PLR0915
         ok, msg = envsetup.fix_gateway_dir(cfg)
         check("网关目录被改用自动找到的那份", ok and cfg.get("gateway.dir") == str(gw), msg)
         check("同时记住 last_gateway_dir", cfg.get("app.last_gateway_dir") == str(gw))
+
+        # --- D2. 「有 converter.py、缺 app/ 包」的部分目录：必须**就地补齐**
+        # 2026-09-23 用户报的 8 段 traceback 就是这个形态 —— 以前它算合格目录，
+        # 一路放行到启动，子进程只在 converter.py 第 1 段崩一句
+        # ModuleNotFoundError: No module named 'app'。
+        section("D2. 缺 app/ 的部分目录：就地补齐")
+        partial = TMP / "gw_partial_noapp"
+        partial.mkdir(parents=True, exist_ok=True)
+        (partial / "converter.py").write_text(
+            "from app.desensitize import TERMS\n", encoding="utf-8")
+        check("部分目录判为「不完整」（不再是合格网关目录）",
+              paths.is_gateway_dir(partial) is False)
+        check("缺的正是 app/__init__.py",
+              paths.gateway_dir_missing(partial) == ("app/__init__.py",),
+              str(paths.gateway_dir_missing(partial)))
+
+        cfg_p = Config()
+        cfg_p.set("gateway.dir", str(partial))
+        cfg_p.set("gateway.python", sys.executable)
+        cfg_p.set("gateway.api_key", "k")
+        cfg_p.set("gateway.port", 9791)
+        item_p = envsetup.diagnose(cfg_p, deep=False).by_key("gateway_dir")
+        check("体检判为可修并点名 app/",
+              item_p.state == "fix" and "app" in item_p.detail,
+              f"{item_p.state} / {item_p.detail[:80]}")
+
+        seen_p: list = []
+        orig_fetch = envsetup.fetch_gateway
+        envsetup.fetch_gateway = lambda c2, *, log=None, into=None: (
+            seen_p.append(into) or (True, "[spy]"))
+        try:
+            ok_p, msg_p = envsetup.fix_gateway_dir(cfg_p)
+        finally:
+            envsetup.fetch_gateway = orig_fetch
+        check("★ 修复动作是「就地补齐」（into 就是这个目录）",
+              ok_p is True and seen_p == [partial], f"{msg_p} / {seen_p}")
+        check("配置里的路径没被改掉", str(cfg_p.get("gateway.dir")) == str(partial))
+        check("没有把部分目录记成 last_gateway_dir",
+              str(cfg_p.get("app.last_gateway_dir") or "") != str(partial))
 
         rep_d = envsetup.diagnose(cfg)
         check("网关定位后补丁判为完好", rep_d.by_key("patch").state == "ok",
